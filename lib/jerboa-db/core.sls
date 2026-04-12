@@ -32,10 +32,24 @@
     ;; Utilities
     db-stats schema-for
 
+    ;; Fulltext search
+    fulltext-search
+
+    ;; Garbage collection
+    gc-collect! gc-stats
+
+    ;; Entity specs
+    validate-entity check-entity-spec define-spec
+
+    ;; Value store
+    make-value-store value-store-put! value-store-get
+    value-store-has? value-store-close value-store-stats
+
     ;; Internal constructors (used by backup/restore)
     make-connection new-db-cache
     connection-current-db-set!
-    connection-next-eid connection-next-eid-set!)
+    connection-next-eid connection-next-eid-set!
+    connection-fulltext-index)
 
   (import (chezscheme)
           (jerboa-db datom)
@@ -47,19 +61,24 @@
           (jerboa-db tx)
           (jerboa-db query engine)
           (jerboa-db query pull)
-          (jerboa-db entity))
+          (jerboa-db entity)
+          (jerboa-db fulltext)
+          (jerboa-db gc)
+          (jerboa-db spec)
+          (jerboa-db value-store))
 
   ;; ---- Connection ----
   ;; A connection holds the mutable state: current db-value, entity counter,
   ;; transaction log, and cache.
 
   (define-record-type connection
-    (fields (mutable current-db)   ;; db-value
-            (mutable next-eid)     ;; next entity ID to assign (mutable cell)
-            (mutable tx-log)       ;; list of tx-reports (most recent first)
-            (mutable db-cache)     ;; LRU cache
-            path                   ;; storage path (":memory:" for in-memory)
-            (mutable db-handles))) ;; LevelDB handles for cleanup (#f for in-memory)
+    (fields (mutable current-db)      ;; db-value
+            (mutable next-eid)        ;; next entity ID to assign (mutable cell)
+            (mutable tx-log)          ;; list of tx-reports (most recent first)
+            (mutable db-cache)        ;; LRU cache
+            path                      ;; storage path (":memory:" for in-memory)
+            (mutable db-handles)      ;; LevelDB handles for cleanup (#f for in-memory)
+            (mutable fulltext-index))) ;; in-memory fulltext inverted index
 
   ;; ---- connect ----
   ;; path = ":memory:" → in-memory RB-tree indices
@@ -95,7 +114,8 @@
                      '()
                      (new-db-cache 10000)
                      path
-                     handles)])
+                     handles
+                     (make-fulltext-index))])
         conn)))
 
   ;; ---- close ----
@@ -127,6 +147,10 @@
       (connection-tx-log-set! conn (cons report (connection-tx-log conn)))
       ;; Clear entity cache (conservative — could be smarter)
       (cache-clear! (connection-db-cache conn))
+      ;; Update fulltext index with new datoms
+      (fulltext-index-datoms! (connection-fulltext-index conn)
+                               (db-value-schema (tx-report-db-after report))
+                               (tx-report-tx-data report))
       report))
 
   ;; ---- Schema materialization ----
@@ -165,10 +189,13 @@
                  [no-hist? (get-val 'db/noHistory)]
                  ;; Assign or lookup attribute ID
                  [aid (schema-intern-attr! schema attr-ident)]
+                 [tuple-attrs (get-val 'db/tupleAttrs)]
+                 [ft? (get-val 'db/fulltext)]
                  [db-attr (make-db-attribute
                             attr-ident aid vtype card
                             uniq (or idx? (and uniq #t))
-                            comp? doc no-hist?)])
+                            comp? doc no-hist?
+                            tuple-attrs ft?)])
             (schema-install-attribute! schema db-attr)))
         ident-datoms)))
 
@@ -225,5 +252,22 @@
 
   (define (schema-for conn)
     (schema-all-attributes (db-value-schema (db conn))))
+
+  ;; ---- Fulltext search ----
+  ;; Search for text in fulltext-indexed attributes on this connection.
+
+  (define (fulltext-search conn attr-ident text)
+    (ft-search (connection-fulltext-index conn)
+               (db-value-schema (db conn))
+               attr-ident
+               text))
+
+  ;; ---- Garbage collection ----
+
+  (define (gc-collect! conn . opts)
+    (apply gc-collect-db! (connection-current-db conn) opts))
+
+  (define (gc-stats conn . opts)
+    (apply gc-stats-db (connection-current-db conn) opts))
 
 ) ;; end library

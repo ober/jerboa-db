@@ -3,7 +3,9 @@
         (jerboa-db datom)
         (jerboa-db schema)
         (jerboa-db history)
-        (jerboa-db entity))
+        (jerboa-db entity)
+        (jerboa-db spec)
+        (jerboa-db value-store))
 
 ;; ---- Test harness ----
 
@@ -474,6 +476,157 @@
     (assert-equal (caar plan) 'find)
     (assert-equal (caadr plan) 'in)
     (assert-equal (caaddr plan) 'plan)))
+
+;; ============================================================
+;; Phase 8 Tests — Advanced Features
+;; ============================================================
+
+;; ---- Composite tuples ----
+
+(test "composite tuple auto-generated when components transacted"
+  (let* ([conn (connect ":memory:")]
+         ;; Schema: component attrs + composite
+         [_ (transact! conn
+              (list
+                `((db/ident . order/customer)
+                  (db/valueType . db.type/string)
+                  (db/cardinality . db.cardinality/one))
+                `((db/ident . order/product)
+                  (db/valueType . db.type/string)
+                  (db/cardinality . db.cardinality/one))
+                `((db/ident . order/by-cust-prod)
+                  (db/valueType . db.type/tuple)
+                  (db/cardinality . db.cardinality/one)
+                  (db/tupleAttrs . (order/customer order/product)))))]
+         ;; Transact entity with both components
+         [tid (tempid)]
+         [r (transact! conn
+              (list `((db/id . ,tid)
+                      (order/customer . "alice")
+                      (order/product  . "widget"))))]
+         [eid (cdr (assv tid (tx-report-tempids r)))]
+         ;; Query for composite attribute
+         [results (q '((find ?composite)
+                        (where (?e order/by-cust-prod ?composite)))
+                     (db conn))])
+    (assert-equal (length results) 1)
+    (assert-equal (caar results) '("alice" "widget"))))
+
+;; ---- Entity specs ----
+
+(test "entity spec validation passes when all attrs present"
+  (let* ([conn (make-person-db)]
+         ;; Add email attr
+         [_ (transact! conn
+              (list `((db/ident . person/email)
+                      (db/valueType . db.type/string)
+                      (db/cardinality . db.cardinality/one)
+                      (db/unique . db.unique/identity)
+                      (db/index . #t))))]
+         ;; Define spec
+         [_ (transact! conn (list (define-spec 'person-spec '(person/name person/email))))]
+         ;; Transact complete entity
+         [tid (tempid)]
+         [r (transact! conn
+              (list `((db/id . ,tid)
+                      (person/name . "Alice")
+                      (person/email . "alice@example.com"))))]
+         [eid (cdr (assv tid (tx-report-tempids r)))]
+         [result (check-entity-spec (db conn) eid 'person-spec)])
+    (assert-equal (car result) 'ok)
+    (assert-equal (cdr result) eid)))
+
+(test "entity spec validation fails when attr missing"
+  (let* ([conn (make-person-db)]
+         [_ (transact! conn
+              (list `((db/ident . person/email)
+                      (db/valueType . db.type/string)
+                      (db/cardinality . db.cardinality/one))))]
+         [_ (transact! conn (list (define-spec 'person-spec '(person/name person/email))))]
+         ;; Entity missing person/email
+         [tid (tempid)]
+         [r (transact! conn (list `((db/id . ,tid) (person/name . "Bob"))))]
+         [eid (cdr (assv tid (tx-report-tempids r)))]
+         [result (check-entity-spec (db conn) eid 'person-spec)])
+    (assert-equal (car result) 'err)
+    ;; missing list should contain person/email
+    (assert-true (member 'person/email (cdr result)))))
+
+;; ---- Fulltext search ----
+
+(test "fulltext search finds entities with matching word"
+  (let* ([conn (connect ":memory:")]
+         [_ (transact! conn
+              (list `((db/ident . article/body)
+                      (db/valueType . db.type/string)
+                      (db/cardinality . db.cardinality/one)
+                      (db/fulltext . #t))))]
+         [tid1 (tempid)]
+         [tid2 (tempid)]
+         [r (transact! conn
+              (list
+                `((db/id . ,tid1) (article/body . "Clojure is a functional language"))
+                `((db/id . ,tid2) (article/body . "Python is popular for data science"))))]
+         [eid1 (cdr (assv tid1 (tx-report-tempids r)))]
+         [results (fulltext-search conn 'article/body "clojure")])
+    (assert-equal (length results) 1)
+    (assert-equal (caar results) eid1)))
+
+(test "fulltext search is case insensitive"
+  (let* ([conn (connect ":memory:")]
+         [_ (transact! conn
+              (list `((db/ident . article/title)
+                      (db/valueType . db.type/string)
+                      (db/cardinality . db.cardinality/one)
+                      (db/fulltext . #t))))]
+         [tid (tempid)]
+         [r (transact! conn (list `((db/id . ,tid) (article/title . "Advanced Scheme Techniques"))))]
+         [eid (cdr (assv tid (tx-report-tempids r)))]
+         ;; Search with uppercase
+         [results (fulltext-search conn 'article/title "SCHEME")])
+    (assert-equal (length results) 1)
+    (assert-equal (caar results) eid)))
+
+;; ---- Datom GC ----
+
+(test "gc-collect! removes retracted no-history datoms"
+  (let* ([conn (connect ":memory:")]
+         [_ (transact! conn
+              (list `((db/ident . session/token)
+                      (db/valueType . db.type/string)
+                      (db/cardinality . db.cardinality/one)
+                      (db/noHistory . #t))))]
+         [tid (tempid)]
+         [r (transact! conn (list `((db/id . ,tid) (session/token . "abc123"))))]
+         [eid (cdr (assv tid (tx-report-tempids r)))]
+         ;; Retract the token
+         [_ (transact! conn (list `(db/retract ,eid session/token "abc123")))]
+         ;; Verify it's retracted (should not appear in current query)
+         [before-gc (q '((find ?tok) (where (?e session/token ?tok))) (db conn))]
+         ;; Run GC
+         [gc-result (gc-collect! conn)]
+         ;; Stats should show removed datoms
+         [removed (cdr (assq 'removed gc-result))])
+    (assert-equal (length before-gc) 0)  ;; already not visible
+    (assert-true (> removed 0))))        ;; GC removed the datom pairs
+
+;; ---- Value store deduplication ----
+
+(test "value store deduplicates repeated values"
+  (let* ([vs (make-value-store)]
+         [hash1 (value-store-put! vs "hello world")]
+         [hash2 (value-store-put! vs "hello world")]
+         [hash3 (value-store-put! vs "different value")]
+         [stats (value-store-stats vs)])
+    ;; Same value -> same hash
+    (assert-equal hash1 hash2)
+    ;; Different value -> different hash
+    (assert-true (not (equal? hash1 hash3)))
+    ;; Dedup count should be 1 (second "hello world" was deduplicated)
+    (assert-equal (cdr (assq 'dedup-saves stats)) 1)
+    ;; Retrieval works
+    (assert-equal (value-store-get vs hash1) "hello world")
+    (assert-equal (value-store-get vs hash3) "different value")))
 
 ;; ============================================================
 ;; Report

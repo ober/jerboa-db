@@ -9,10 +9,15 @@
     new-tx-log tx-log?
     tx-log-append! tx-log-replay tx-log-range
     tx-log-entry? tx-log-entry-tx-id tx-log-entry-instant tx-log-entry-datoms
-    tx-log-count tx-log-latest-tx)
+    tx-log-count tx-log-latest-tx
+    tx-log-load-segments tx-log-segment-dir)
 
   (import (chezscheme)
           (jerboa-db datom))
+
+  ;; POSIX sync() — flushes all dirty kernel buffers to disk.
+  ;; Ensures written segments survive power loss, not just process crash.
+  (define $os-sync (foreign-procedure "sync" () void))
 
   ;; ---- Transaction log entry ----
 
@@ -49,6 +54,8 @@
       ;; Write to disk if persistent
       (when (tx-log-segment-dir log)
         (write-entry-to-segment! log entry)
+        ;; Sync to disk for crash durability
+        ($os-sync)
         ;; Rotate segment if needed
         (when (>= (tx-log-current-segment-count log)
                    (tx-log-segment-size log))

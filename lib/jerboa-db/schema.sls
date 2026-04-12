@@ -12,6 +12,7 @@
     db-attribute-ident db-attribute-id db-attribute-value-type
     db-attribute-cardinality db-attribute-unique db-attribute-index?
     db-attribute-is-component? db-attribute-doc db-attribute-no-history?
+    db-attribute-tuple-attrs db-attribute-fulltext?
 
     ;; Schema registry
     new-schema-registry schema-registry?
@@ -23,6 +24,8 @@
     +db/ident+ +db/valueType+ +db/cardinality+ +db/unique+
     +db/index+ +db/doc+ +db/isComponent+ +db/noHistory+
     +db/txInstant+ +db/id+
+    +db/tupleAttrs+ +db/ensure+ +db/fulltext+
+    +spec/ident+ +spec/attrs+
     +first-user-attr-id+
 
     ;; Value type predicates
@@ -45,7 +48,9 @@
             index?         ;; boolean — populate AVET?
             is-component?  ;; boolean — cascade retractions?
             doc            ;; string or #f
-            no-history?))  ;; boolean — skip history?
+            no-history?    ;; boolean — skip history?
+            tuple-attrs    ;; list of component attr ident symbols for composite, or #f
+            fulltext?))    ;; boolean — enable fulltext indexing
 
   ;; ---- Schema registry ----
   ;; Maps ident (symbol) <-> id (integer), and id -> db-attribute.
@@ -109,6 +114,11 @@
   (define +db/noHistory+   'db/noHistory)
   (define +db/txInstant+   'db/txInstant)
   (define +db/id+          'db/id)
+  (define +db/tupleAttrs+  'db/tupleAttrs)
+  (define +db/ensure+      'db/ensure)
+  (define +db/fulltext+    'db/fulltext)
+  (define +spec/ident+     'spec/ident)
+  (define +spec/attrs+     'spec/attrs)
 
   (define +first-user-attr-id+ 20)
 
@@ -116,7 +126,7 @@
 
   (define (bootstrap-schema! reg)
     (define (install! id ident vtype card)
-      (let ([attr (make-db-attribute ident id vtype card #f #t #f #f #f)])
+      (let ([attr (make-db-attribute ident id vtype card #f #t #f #f #f #f #f)])
         (schema-install-attribute! reg attr)))
     ;; Reserve IDs 0-19 for system attributes
     (install! 0  +db/ident+       'db.type/keyword 'db.cardinality/one)
@@ -128,6 +138,11 @@
     (install! 6  +db/isComponent+ 'db.type/boolean 'db.cardinality/one)
     (install! 7  +db/noHistory+   'db.type/boolean 'db.cardinality/one)
     (install! 8  +db/txInstant+   'db.type/instant 'db.cardinality/one)
+    (install! 9  +db/tupleAttrs+  'db.type/any     'db.cardinality/one)
+    (install! 10 +db/ensure+      'db.type/keyword 'db.cardinality/one)
+    (install! 11 +db/fulltext+    'db.type/boolean 'db.cardinality/one)
+    (install! 12 +spec/ident+     'db.type/keyword 'db.cardinality/one)
+    (install! 13 +spec/attrs+     'db.type/any     'db.cardinality/one)
     (schema-registry-next-id-set! reg +first-user-attr-id+))
 
   ;; ---- Value type validation ----
@@ -136,7 +151,7 @@
     (memq vtype '(db.type/string db.type/long db.type/double
                   db.type/boolean db.type/instant db.type/uuid
                   db.type/ref db.type/keyword db.type/bytes
-                  db.type/symbol)))
+                  db.type/symbol db.type/tuple db.type/any)))
 
   (define (value-matches-type? vtype value)
     (case vtype
@@ -150,6 +165,8 @@
       [(db.type/keyword) (symbol? value)]
       [(db.type/bytes)   (bytevector? value)]
       [(db.type/symbol)  (symbol? value)]
+      [(db.type/tuple)   (list? value)]
+      [(db.type/any)     #t]
       [else #f]))
 
   (define (coerce-value vtype raw)

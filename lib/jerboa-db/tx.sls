@@ -319,6 +319,22 @@
           (emit-datom! eid aid old-val #f)
           (emit-datom! eid aid new-val #t)))
 
+      ;; Effective value for composite tuple generation:
+      ;; checks pending produced-datoms first, then falls back to current index value.
+      (define (effective-value-for-entity eid attr-ident)
+        (let ([attr (schema-lookup-by-ident schema attr-ident)])
+          (and attr
+               (let* ([aid (db-attribute-id attr)]
+                      [pending (filter (lambda (d)
+                                         (and (= (datom-e d) eid)
+                                              (= (datom-a d) aid)
+                                              (datom-added? d)))
+                                       produced-datoms)])
+                 (if (pair? pending)
+                     (datom-v (car (reverse pending)))
+                     (let ([cur (current-value eid aid)])
+                       (and cur (datom-v cur))))))))
+
       ;; --- Main processing loop ---
 
       ;; Process each operation
@@ -348,6 +364,55 @@
         (when tx-instant-attr
           (emit-datom! tx-id (db-attribute-id tx-instant-attr)
                        (time-second (current-time)) #t)))
+
+      ;; ---- Composite tuple generation ----
+      ;; For each entity that had changes, check if any changed attribute is a
+      ;; component of a composite tuple attribute. If so, gather all component
+      ;; values and emit the composite datom.
+
+      (let* ([affected-eids
+              (let ([seen (make-hashtable equal-hash equal?)])
+                (for-each (lambda (d) (hashtable-set! seen (datom-e d) #t))
+                          produced-datoms)
+                (let-values ([(keys _) (hashtable-entries seen)])
+                  (vector->list keys)))]
+             [composite-attrs
+              (filter (lambda (a) (db-attribute-tuple-attrs a))
+                      (schema-all-attributes schema))])
+        (for-each
+          (lambda (eid)
+            (for-each
+              (lambda (comp-attr)
+                (let* ([components (db-attribute-tuple-attrs comp-attr)]
+                       ;; Collect component attribute IDs
+                       [comp-aids
+                        (let loop ([l components] [acc '()])
+                          (if (null? l) (reverse acc)
+                              (let ([ca (schema-lookup-by-ident schema (car l))])
+                                (loop (cdr l)
+                                      (if ca (cons (db-attribute-id ca) acc) acc)))))]
+                       ;; Check if any component was changed for this entity
+                       [changed?
+                        (let loop ([ds produced-datoms])
+                          (and (pair? ds)
+                               (or (and (= (datom-e (car ds)) eid)
+                                        (memv (datom-a (car ds)) comp-aids))
+                                   (loop (cdr ds)))))])
+                  (when changed?
+                    ;; Gather all component values
+                    (let ([vals (map (lambda (cid)
+                                      (effective-value-for-entity eid cid))
+                                    components)])
+                      ;; Only emit if ALL components have values
+                      (when (not (memv #f vals))
+                        ;; Retract old composite value if any
+                        (let* ([caid (db-attribute-id comp-attr)]
+                               [old (current-value eid caid)])
+                          (when old (emit-datom! eid caid (datom-v old) #f)))
+                        ;; Emit new composite tuple (list of values)
+                        (emit-datom! eid (db-attribute-id comp-attr) vals #t))))))
+              composite-attrs))
+          affected-eids))
 
       ;; Write all datoms to indices
       (let ([final-datoms (reverse produced-datoms)])

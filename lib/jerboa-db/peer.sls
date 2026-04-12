@@ -3,10 +3,14 @@
 ;;;
 ;;; Connects to a Jerboa-DB server over HTTP/WebSocket.
 ;;; Same API as embedded mode (connect, db, transact!, q, pull).
+;;;
+;;; Automatic failover: connect-remote* accepts a list of URLs. If a request
+;;; to the primary URL fails, the client retries the next URL with exponential
+;;; backoff. Useful for Raft-based HA deployments where leadership can change.
 
 (library (jerboa-db peer)
   (export
-    connect-remote remote-connection?
+    connect-remote connect-remote* remote-connection?
     remote-db remote-transact! remote-q remote-pull
     remote-tx-stream)
 
@@ -21,13 +25,29 @@
   ;; ---- Remote connection ----
 
   (define-record-type remote-connection
-    (fields url            ;; base URL: "http://localhost:8484"
-            (mutable last-tx))) ;; last known transaction ID
+    (fields (mutable urls)        ;; list of URLs, first is current primary
+            (mutable last-tx)     ;; last known transaction ID
+            (mutable retry-count))) ;; consecutive failures on current primary
 
-  ;; ---- Helpers ----
+  (define (make-single-remote-connection url)
+    (make-remote-connection (list url) 0 0))
+
+  ;; ---- URL management ----
+
+  (define (current-url conn)
+    (car (remote-connection-urls conn)))
 
   (define (build-url conn path)
-    (string-append (remote-connection-url conn) path))
+    (string-append (current-url conn) path))
+
+  ;; Rotate: move failed primary to end, try next URL
+  (define (failover! conn)
+    (let ([urls (remote-connection-urls conn)])
+      (when (> (length urls) 1)
+        (remote-connection-urls-set! conn (append (cdr urls) (list (car urls))))
+        (remote-connection-retry-count-set! conn 0))))
+
+  ;; ---- HTTP helpers ----
 
   (define (check-response! who resp url)
     (let ([status (request-status resp)])
@@ -36,84 +56,120 @@
           (string-append "HTTP error " (number->string status) " from " url)
           (request-text resp)))))
 
+  ;; Execute a thunk with retry+failover on transient errors.
+  ;; Retries up to max-retries times with exponential backoff (100ms, 200ms, 400ms).
+
+  (define (with-retry conn thunk max-retries)
+    (let loop ([attempt 0])
+      (guard (exn
+              [#t
+               (remote-connection-retry-count-set! conn
+                 (+ (remote-connection-retry-count conn) 1))
+               (if (< attempt max-retries)
+                   (begin
+                     (failover! conn)
+                     ;; Exponential backoff: sleep 100ms * 2^attempt
+                     (let ([delay-s (/ (* 100 (expt 2 attempt)) 1000)])
+                       (sleep (make-time 'time-duration
+                                (inexact->exact (floor (* delay-s 1000000000)))
+                                0)))
+                     (loop (+ attempt 1)))
+                   (raise exn))])
+        (thunk))))
+
   ;; POST with EDN body; returns parsed EDN from response body.
   (define (post-edn conn path body-obj)
-    (let* ([url  (build-url conn path)]
-           [body (edn->string body-obj)]
-           [resp (http-post url
-                   '(("Content-Type" . "application/edn")
-                     ("Accept"       . "application/edn"))
-                   body)])
-      (check-response! 'post-edn resp url)
-      (string->edn (request-text resp))))
+    (with-retry conn
+      (lambda ()
+        (let* ([url  (build-url conn path)]
+               [body (edn->string body-obj)]
+               [resp (http-post url
+                       '(("Content-Type" . "application/edn")
+                         ("Accept"       . "application/edn"))
+                       body)])
+          (check-response! 'post-edn resp url)
+          (string->edn (request-text resp))))
+      3))
 
   ;; GET; returns parsed EDN from response body.
   (define (get-edn conn path)
-    (let* ([url  (build-url conn path)]
-           [resp (http-get url
-                   '(("Accept" . "application/edn")))])
-      (check-response! 'get-edn resp url)
-      (string->edn (request-text resp))))
+    (with-retry conn
+      (lambda ()
+        (let* ([url  (build-url conn path)]
+               [resp (http-get url '(("Accept" . "application/edn")))])
+          (check-response! 'get-edn resp url)
+          (string->edn (request-text resp))))
+      3))
 
   ;; ---- connect-remote ----
-  ;; Verifies connectivity via GET /health and returns a connection record.
+  ;; Single URL. Verifies connectivity via GET /health.
 
   (define (connect-remote url)
-    (let* ([health-url (string-append url "/health")]
+    (let ([conn (make-single-remote-connection url)])
+      (verify-connectivity! conn)
+      conn))
+
+  ;; ---- connect-remote* ----
+  ;; Multiple URLs for automatic failover.
+
+  (define (connect-remote* urls)
+    (unless (pair? urls)
+      (error 'connect-remote* "At least one URL required"))
+    (let ([conn (make-remote-connection urls 0 0)])
+      ;; Try to connect to any available URL
+      (let loop ([remaining urls])
+        (if (null? remaining)
+            (error 'connect-remote* "Could not reach any server" urls)
+            (guard (exn [#t (loop (cdr remaining))])
+              (remote-connection-urls-set! conn
+                (append (list (car remaining))
+                        (filter (lambda (u) (not (string=? u (car remaining)))) urls)))
+              (verify-connectivity! conn))))
+      conn))
+
+  (define (verify-connectivity! conn)
+    (let* ([health-url (string-append (current-url conn) "/health")]
            [resp (guard (exn [#t #f])
                    (http-get health-url))])
       (unless resp
-        (error 'connect-remote "Cannot reach server" url))
-      (let ([status (request-status resp)]
-            [body   (request-text resp)])
-        (unless (and (= status 200) (string? body) (string=? body "ok"))
-          (error 'connect-remote "Server health check failed" url status)))
-      (make-remote-connection url 0)))
+        (error 'connect-remote "Cannot reach server" (current-url conn)))
+      (let ([status (request-status resp)])
+        (unless (= status 200)
+          (error 'connect-remote "Server health check failed"
+                 (current-url conn) status)))))
 
   ;; ---- remote-db ----
-  ;; Fetches current db stats; updates cached last-tx.
 
   (define (remote-db conn)
     (let ([stats (get-edn conn "/api/db/stats")])
       (when (pair? stats)
-        (let ([basis-tx-entry (assq 'basis-tx stats)])
-          (when basis-tx-entry
-            (remote-connection-last-tx-set! conn (cdr basis-tx-entry)))))
+        (let ([e (assq 'basis-tx stats)])
+          (when e (remote-connection-last-tx-set! conn (cdr e)))))
       stats))
 
   ;; ---- remote-transact! ----
-  ;; POST /api/transact with EDN tx-ops, returns the tx report alist.
 
   (define (remote-transact! conn tx-ops)
     (let ([result (post-edn conn "/api/transact" tx-ops)])
       (when (pair? result)
-        (let ([tx-id-entry (assq 'tx-id result)])
-          (when tx-id-entry
-            (remote-connection-last-tx-set! conn (cdr tx-id-entry)))))
+        (let ([e (assq 'tx-id result)])
+          (when e (remote-connection-last-tx-set! conn (cdr e)))))
       result))
 
   ;; ---- remote-q ----
-  ;; POST /api/query with EDN query form, returns list of result tuples.
 
   (define (remote-q conn query-form)
     (post-edn conn "/api/query" query-form))
 
   ;; ---- remote-pull ----
-  ;; POST /api/pull with EDN [pattern eid], returns entity map.
 
   (define (remote-pull conn pattern eid)
     (post-edn conn "/api/pull" (list pattern eid)))
 
   ;; ---- remote-tx-stream ----
-  ;; Connects to /api/tx-stream via WebSocket, calls handler with each
-  ;; transaction report (as a parsed EDN alist) until the stream ends.
-  ;; handler: (lambda (tx-data) ...) where tx-data is a parsed EDN value.
-  ;;
-  ;; Note: This is a synchronous loop; run in a separate thread to avoid
-  ;; blocking the caller.
 
   (define (remote-tx-stream conn handler)
     (error 'remote-tx-stream
-      "WebSocket tx-stream requires fiber context; use (std fiber) to spawn a fiber and call remote-tx-stream/fiber instead"))
+      "WebSocket tx-stream requires fiber context; use (std fiber) to spawn"))
 
 ) ;; end library
