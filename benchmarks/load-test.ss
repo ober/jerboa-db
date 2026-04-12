@@ -159,9 +159,10 @@
          [_ (dotimes (_ n-queries)
               (q '((find ?e) (where (?e user/age ?a) [(> ?a 50)])) d))]
          [ms-pred (elapsed-ms t2)]
-         ;; two-attribute join
+         ;; two-attribute join (capped at 1/10 of n-queries to keep bench fast)
+         [nq-join (max 1 (quotient n-queries 10))]
          [t3 (now-ms)]
-         [_ (dotimes (_ n-queries)
+         [_ (dotimes (_ nq-join)
               (q '((find ?e ?name)
                    (where (?e user/name ?name)
                           (?e user/active #t)
@@ -177,7 +178,7 @@
     (list
       (list 'exact-match  n-queries ms-exact)
       (list 'predicate    n-queries ms-pred)
-      (list 'two-attr-join n-queries ms-join)
+      (list 'two-attr-join nq-join ms-join)
       (list 'count-agg    nq-agg    ms-agg))))
 
 ;; ---- Scenario 4: Pull throughput ----

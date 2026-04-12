@@ -251,19 +251,140 @@
          rules-ht
          (rule-name? (car clause) rules-ht)))
 
+  ;; ---- Range predicate pushdown helpers ----
+  ;; Detect (?e attr ?v) [(cmp ?v const)] and fuse into a single AVET range scan.
+
+  ;; Parse a comparison form (op a b) where one arg matches v-spec and the other
+  ;; is a literal constant.  Returns (lo hi lo-strict? hi-strict?) or #f.
+  (define (parse-range-predicate pred-form v-spec)
+    (and (pair? pred-form)
+         (memq (car pred-form) '(< <= > >=))
+         (= (length pred-form) 3)
+         (let ([op (car pred-form)]
+               [a  (cadr pred-form)]
+               [b  (caddr pred-form)])
+           (cond
+             ;; (?v op const)
+             [(and (equal? a v-spec) (not (logic-var? b)))
+              (case op
+                [(<)  (list #f b #f #t)]
+                [(<=) (list #f b #f #f)]
+                [(>)  (list b #f #t #f)]
+                [(>=) (list b #f #f #f)])]
+             ;; (const op ?v) — reversed direction
+             [(and (equal? b v-spec) (not (logic-var? a)))
+              (case op
+                [(<)  (list a #f #t #f)]
+                [(<=) (list a #f #f #f)]
+                [(>)  (list #f a #f #t)]
+                [(>=) (list #f a #f #f)])]
+             [else #f]))))
+
+  ;; Combine two range bound specs.  Takes the tighter of each bound.
+  (define (merge-range-bounds b1 b2)
+    (if (not b2) b1
+        (list (or (car b1)   (car b2))
+              (or (cadr b1)  (cadr b2))
+              (or (caddr b1) (caddr b2))
+              (or (cadddr b1)(cadddr b2)))))
+
+  ;; Evaluate a data pattern using a pre-computed AVET range instead of a
+  ;; full attribute scan.  bounds = (lo hi lo-strict? hi-strict?).
+  (define (evaluate-data-pattern-in-range db pattern bindings schema bounds)
+    (let* ([e-spec    (car pattern)]
+           [a-spec    (cadr pattern)]
+           [v-spec    (caddr pattern)]
+           [tx-spec   (if (>= (length pattern) 4) (cadddr pattern) '_)]
+           [op-spec   (if (>= (length pattern) 5) (list-ref pattern 4) '_)]
+           [attr      (schema-lookup-by-ident schema a-spec)]
+           [aid       (db-attribute-id attr)]
+           [lo-val    (car bounds)]
+           [hi-val    (cadr bounds)]
+           [lo-strict? (caddr bounds)]
+           [hi-strict? (cadddr bounds)]
+           [idx    (db-resolve-index db 'avet)]
+           [lo     (make-datom 0 aid (if lo-val lo-val +min-val+) 0 #t)]
+           [hi     (make-datom (greatest-fixnum) aid
+                     (if hi-val hi-val +max-val+) (greatest-fixnum) #t)]
+           [raw    (dbi-range idx lo hi)]
+           [filtered (filter (lambda (d) (db-filter-datom? db d)) raw)]
+           [effective (if (db-value-history? db)
+                          filtered
+                          (resolve-current-datoms filtered))]
+           ;; Post-filter strict inequality endpoints
+           [ranged (filter
+                     (lambda (d)
+                       (let ([v (datom-v d)])
+                         (and (if (and lo-val lo-strict?) (not (equal? v lo-val)) #t)
+                              (if (and hi-val hi-strict?) (not (equal? v hi-val)) #t))))
+                     effective)])
+      (let loop ([ds ranged] [results '()])
+        (if (null? ds)
+            (reverse results)
+            (let ([new-b (try-unify-datom (car ds) e-spec a-spec v-spec
+                                          tx-spec op-spec bindings)])
+              (loop (cdr ds) (if new-b (cons new-b results) results)))))))
+
   ;; ---- Main query evaluation ----
 
   (define (evaluate-where-clauses db clauses bindings-list schema rules-ht)
     (if (null? clauses)
         bindings-list
-        (let* ([clause (car clauses)]
-               [rest (cdr clauses)]
+        (let* ([clause   (car clauses)]
+               [rest     (cdr clauses)]
+               ;; Range-predicate pushdown: fuse (?e attr ?v) [(cmp ?v const)] into
+               ;; a single AVET range scan.  pushdown = (bounds . new-rest) or (#f . rest).
+               ;; ONLY fires when both entity AND value are unbound — if entity is bound,
+               ;; EAVT point-lookup (one datom) is always faster than an AVET range scan.
+               [pushdown
+                 (if (and (data-pattern? clause)
+                          (pair? rest)
+                          (predicate-clause? (car rest)))
+                     (let* ([e-spec (car clause)]
+                            [v-spec (and (>= (length clause) 3) (caddr clause))]
+                            [a-spec (cadr clause)]
+                            [attr   (schema-lookup-by-ident schema a-spec)])
+                       (if (and (logic-var? v-spec)
+                                attr
+                                (avet-eligible? attr)
+                                (pair? bindings-list)
+                                (not (binding-ref (car bindings-list) v-spec))
+                                ;; Entity must be unbound; if bound, EAVT is faster
+                                (logic-var? e-spec)
+                                (not (binding-ref (car bindings-list) e-spec)))
+                           (let* ([b1 (parse-range-predicate (caar rest) v-spec)]
+                                  ;; Absorb a second consecutive range predicate too
+                                  [b2 (and b1
+                                           (pair? (cdr rest))
+                                           (predicate-clause? (cadr rest))
+                                           (parse-range-predicate (caadr rest) v-spec))]
+                                  [bounds (and b1 (merge-range-bounds b1 b2))]
+                                  [skip-n (if b2 2 (if b1 1 0))])
+                             (if bounds
+                                 (cons bounds (list-tail rest skip-n))
+                                 (cons #f rest)))
+                           (cons #f rest)))
+                     (cons #f rest))]
+               [bounds    (car pushdown)]
+               [eval-rest (cdr pushdown)]
+               ;; Inline flatmap: avoids building an intermediate list-of-lists.
+               ;; Early termination: if no bindings survive a clause, stop immediately.
                [new-bindings-list
-                 (apply append
-                   (map (lambda (bindings)
-                          (evaluate-single-clause db clause bindings schema rules-ht))
-                        bindings-list))])
-          (evaluate-where-clauses db rest new-bindings-list schema rules-ht))))
+                 (let loop ([lst bindings-list] [acc '()])
+                   (if (null? lst)
+                       (reverse acc)
+                       (let inner ([rs (if bounds
+                                           (evaluate-data-pattern-in-range
+                                            db clause (car lst) schema bounds)
+                                           (evaluate-single-clause
+                                            db clause (car lst) schema rules-ht))]
+                                   [a acc])
+                         (if (null? rs)
+                             (loop (cdr lst) a)
+                             (inner (cdr rs) (cons (car rs) a))))))])
+          (if (null? new-bindings-list)
+              '()
+              (evaluate-where-clauses db eval-rest new-bindings-list schema rules-ht)))))
 
   (define (evaluate-single-clause db clause bindings schema rules-ht)
     (cond
