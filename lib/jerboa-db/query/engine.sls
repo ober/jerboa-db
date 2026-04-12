@@ -26,16 +26,19 @@
          (char=? (string-ref (symbol->string x) 0) #\?)))
 
   ;; ---- Binding environment ----
-  ;; A binding is an alist: ((var . value) ...)
+  ;; A binding is an eq? hashtable: var-symbol → value.
+  ;; O(1) lookup vs O(n) for alists. Copy-on-extend preserves immutability
+  ;; across the binding-set list used during clause evaluation.
 
-  (define empty-bindings '())
+  (define (make-empty-bindings) (make-hashtable symbol-hash eq?))
 
   (define (binding-ref bindings var)
-    (let ([found (assq var bindings)])
-      (and found (cdr found))))
+    (hashtable-ref bindings var #f))
 
   (define (binding-set bindings var val)
-    (cons (cons var val) bindings))
+    (let ([new-ht (hashtable-copy bindings #t)])
+      (hashtable-set! new-ht var val)
+      new-ht))
 
   (define (resolve-in-bindings bindings x)
     (if (logic-var? x)
@@ -78,22 +81,23 @@
   ;; assertion, the value is live; if a retraction, the value is gone.
 
   (define (resolve-current-datoms datoms)
-    ;; datoms come sorted from an index with tx as last key, so within each
-    ;; (e,a,v) group, later entries have higher tx. Walk the list, tracking
-    ;; the latest datom per (e,a,v).
-    (let ([ht (make-hashtable equal-hash equal?)])
-      (for-each
-        (lambda (d)
-          (let ([key (list (datom-e d) (datom-a d) (datom-v d))])
-            (let ([existing (hashtable-ref ht key #f)])
-              (when (or (not existing)
-                        (> (datom-tx d) (datom-tx existing)))
-                (hashtable-set! ht key d)))))
-        datoms)
-      ;; Keep only triples whose latest datom is an assertion
-      (let-values ([(keys vals) (hashtable-entries ht)])
-        (let ([vlist (vector->list vals)])
-          (filter datom-added? vlist)))))
+    ;; Fast path: if no retractions in the scanned range, every datom is a current
+    ;; assertion — skip the hashtable entirely. This is the common case for
+    ;; freshly-written or lightly-updated databases.
+    (if (for-all datom-added? datoms)
+        datoms
+        ;; Slow path: build (e,a,v) → latest-datom map and filter for assertions.
+        (let ([ht (make-hashtable equal-hash equal?)])
+          (for-each
+            (lambda (d)
+              (let ([key (list (datom-e d) (datom-a d) (datom-v d))])
+                (let ([existing (hashtable-ref ht key #f)])
+                  (when (or (not existing)
+                            (> (datom-tx d) (datom-tx existing)))
+                    (hashtable-set! ht key d)))))
+            datoms)
+          (let-values ([(keys vals) (hashtable-entries ht)])
+            (filter datom-added? (vector->list vals))))))
 
   ;; ---- Data pattern evaluation ----
   ;; A data pattern like (?e person/name ?name) is matched against an index.
@@ -118,7 +122,8 @@
              [index-name (cond
                            [e-val 'eavt]
                            [(and v-val (ref-type? attr)) 'vaet]
-                           [(and v-val (indexed-attr? attr)) 'avet]
+                           ;; Use AVET for all scalar attrs — tx.sls now indexes them all
+                           [(and v-val (avet-eligible? attr)) 'avet]
                            [else 'aevt])]
              [idx (db-resolve-index db index-name)]
              ;; Build range boundaries
@@ -331,9 +336,16 @@
     (exists (lambda (v) (and (pair? v) (aggregate? (car v)))) find-vars))
 
   (define (apply-aggregates find-vars bindings-list)
-    ;; Group non-aggregate vars, then aggregate within each group.
-    (let* ([grouping-vars (filter (lambda (v) (not (and (pair? v) (aggregate? (car v)))))
-                                  find-vars)]
+    ;; Fast path: single (count ?x) with no grouping vars — just count rows.
+    ;; Skips group-bindings hashtable construction and per-row value extraction.
+    (if (and (= 1 (length find-vars))
+             (pair? (car find-vars))
+             (eq? 'count (caar find-vars))
+             (logic-var? (cadar find-vars)))
+        (list (list (length bindings-list)))
+        ;; General path: group non-aggregate vars, then aggregate within each group.
+        (let* ([grouping-vars (filter (lambda (v) (not (and (pair? v) (aggregate? (car v)))))
+                                      find-vars)]
            [agg-specs (filter (lambda (v) (and (pair? v) (aggregate? (car v))))
                               find-vars)]
            ;; Group bindings by grouping vars
@@ -355,7 +367,7 @@
                               (binding-ref sample-binding fv)
                               fv)))
                     find-vars)))
-           groups)))
+           groups))))
 
   (define (group-bindings grouping-vars bindings-list)
     ;; Group bindings by the values of grouping-vars.
@@ -403,7 +415,7 @@
            ;;   [[?x ?y]]— relation: input is a list of tuples
            [input-bindings
              (let loop ([ivs in-vars] [inps inputs]
-                        [bindings-list (list empty-bindings)])
+                        [bindings-list (list (make-empty-bindings))])
                (cond
                  [(null? ivs) bindings-list]
                  [(eq? (car ivs) '$) (loop (cdr ivs) inps bindings-list)]
@@ -468,7 +480,7 @@
            ;; Reorder clauses for optimal execution
            ;; input-bindings is now a list of binding-sets
            [bound-at-start (if (null? input-bindings) '()
-                               (map car (car input-bindings)))]
+                               (vector->list (hashtable-keys (car input-bindings))))]
            [ordered-clauses (reorder-clauses where-clauses bound-at-start schema)]
            ;; Execute
            [result-bindings

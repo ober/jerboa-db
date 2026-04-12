@@ -59,6 +59,15 @@
            [tempid-map '()]
            [produced-datoms '()])
 
+      ;; --- Schema lookup cache ---
+      ;; Avoids repeated registry scans for the same attribute within one transaction.
+      (define schema-cache (make-hashtable symbol-hash eq?))
+      (define (lookup-attr ident)
+        (or (hashtable-ref schema-cache ident #f)
+            (let ([attr (schema-lookup-by-ident schema ident)])
+              (when attr (hashtable-set! schema-cache ident attr))
+              attr)))
+
       ;; --- Helpers ---
 
       (define (resolve-eid raw-eid)
@@ -71,7 +80,7 @@
            ;; Lookup ref: (attr-ident value)
            (let* ([attr-ident (car raw-eid)]
                   [val (cadr raw-eid)]
-                  [attr (schema-lookup-by-ident schema attr-ident)])
+                  [attr (lookup-attr attr-ident)])
              (unless attr
                (error 'transact! "Unknown attribute in lookup ref" attr-ident))
              (unless (db-attribute-unique attr)
@@ -106,7 +115,7 @@
               (let* ([pair (car pairs)]
                      [attr-ident (car pair)]
                      [val (cdr pair)]
-                     [attr (schema-lookup-by-ident schema attr-ident)])
+                     [attr (lookup-attr attr-ident)])
                 (if (and attr (eq? (db-attribute-unique attr) 'db.unique/identity))
                     (let ([existing (find-entity-by-unique attr val)])
                       (or existing (loop (cdr pairs))))
@@ -204,7 +213,7 @@
             (lambda (pair)
               (let* ([attr-ident (car pair)]
                      [val (cdr pair)]
-                     [attr (schema-lookup-by-ident schema attr-ident)])
+                     [attr (lookup-attr attr-ident)])
                 (unless attr
                   ;; Auto-intern unknown attributes as schema if they look like schema
                   ;; For now, error on unknown attributes
@@ -257,7 +266,7 @@
 
       (define (process-add! eid-raw attr-ident val)
         (let* ([eid (resolve-eid eid-raw)]
-               [attr (schema-lookup-by-ident schema attr-ident)])
+               [attr (lookup-attr attr-ident)])
           (unless attr (error 'transact! "Unknown attribute" attr-ident))
           (let* ([aid (db-attribute-id attr)]
                  [cval (coerce-value (db-attribute-value-type attr) val)]
@@ -277,7 +286,7 @@
             (emit-datom! eid aid final-val #t))))
 
       (define (process-retract! eid attr-ident val)
-        (let ([attr (schema-lookup-by-ident schema attr-ident)])
+        (let ([attr (lookup-attr attr-ident)])
           (unless attr (error 'transact! "Unknown attribute" attr-ident))
           (emit-datom! eid (db-attribute-id attr) val #f)))
 
@@ -308,7 +317,7 @@
                 vals)))))
 
       (define (process-cas! eid attr-ident old-val new-val)
-        (let* ([attr (schema-lookup-by-ident schema attr-ident)]
+        (let* ([attr (lookup-attr attr-ident)]
                [aid (db-attribute-id attr)]
                [cur (current-value eid aid)])
           (unless (and cur (equal? (datom-v cur) old-val))
@@ -322,7 +331,7 @@
       ;; Effective value for composite tuple generation:
       ;; checks pending produced-datoms first, then falls back to current index value.
       (define (effective-value-for-entity eid attr-ident)
-        (let ([attr (schema-lookup-by-ident schema attr-ident)])
+        (let ([attr (lookup-attr attr-ident)])
           (and attr
                (let* ([aid (db-attribute-id attr)]
                       [pending (filter (lambda (d)
@@ -360,7 +369,7 @@
         tx-ops)
 
       ;; Add transaction metadata: :db/txInstant
-      (let ([tx-instant-attr (schema-lookup-by-ident schema +db/txInstant+)])
+      (let ([tx-instant-attr (lookup-attr +db/txInstant+)])
         (when tx-instant-attr
           (emit-datom! tx-id (db-attribute-id tx-instant-attr)
                        (time-second (current-time)) #t)))
@@ -388,7 +397,7 @@
                        [comp-aids
                         (let loop ([l components] [acc '()])
                           (if (null? l) (reverse acc)
-                              (let ([ca (schema-lookup-by-ident schema (car l))])
+                              (let ([ca (lookup-attr (car l))])
                                 (loop (cdr l)
                                       (if ca (cons (db-attribute-id ca) acc) acc)))))]
                        ;; Check if any component was changed for this entity
@@ -421,9 +430,9 @@
             ;; Always write to EAVT and AEVT
             (dbi-add! (index-set-eavt indices) d)
             (dbi-add! (index-set-aevt indices) d)
-            ;; Write to AVET if attribute is indexed or unique
+            ;; Write to AVET for all scalar attributes (enables fast value lookups)
             (let ([attr (schema-lookup-by-id schema (datom-a d))])
-              (when (and attr (indexed-attr? attr))
+              (when (avet-eligible? attr)
                 (dbi-add! (index-set-avet indices) d))
               ;; Write to VAET if attribute is ref type
               (when (and attr (ref-type? attr))

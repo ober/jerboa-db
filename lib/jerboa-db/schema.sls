@@ -30,7 +30,7 @@
 
     ;; Value type predicates
     valid-value-type? value-matches-type? coerce-value
-    cardinality-one? cardinality-many? ref-type? indexed-attr?
+    cardinality-one? cardinality-many? ref-type? indexed-attr? avet-eligible?
 
     ;; Bootstrap
     bootstrap-schema!)
@@ -205,5 +205,13 @@
   (define (indexed-attr? attr)
     (or (db-attribute-index? attr)
         (db-attribute-unique attr)))
+
+  ;; avet-eligible?: should this attribute be stored in the AVET index?
+  ;; True for all scalar (non-ref, non-tuple) attributes.
+  ;; Ref types use VAET for reverse lookups; tuple/any values are not AVET-indexable.
+  (define (avet-eligible? attr)
+    (and attr
+         (not (memq (db-attribute-value-type attr)
+                    '(db.type/ref db.type/tuple db.type/any)))))
 
 ) ;; end library

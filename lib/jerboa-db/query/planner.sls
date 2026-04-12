@@ -90,10 +90,11 @@
          (let ([attr (and a-bound? (schema-lookup-by-ident schema a-pos))])
            (+
              (if e-bound? 100 0)        ;; entity bound: very selective
-             (if (and attr (db-attribute-unique attr)) 90 0)  ;; unique attr
-             (if v-bound? 50 0)         ;; value bound
-             (if a-bound? 20 0)         ;; attribute bound (always true for valid queries)
-             (if (and attr (indexed-attr? attr)) 10 0))))]  ;; indexed
+             (if (and attr (db-attribute-unique attr)) 90 0)  ;; unique attr: point lookup
+             ;; V-bound + scalar attr: AVET range scan (fast).
+             ;; V-bound + ref attr: VAET reverse lookup (also fast).
+             (if v-bound? (if (and attr (avet-eligible? attr)) 60 50) 0)
+             (if a-bound? 20 0))))]  ;; attribute bound (always true for valid queries)
       ;; Predicate/function clauses: score by how many vars are already bound
       [(and (pair? clause) (pair? (car clause)))
        (let ([used (clause-used-vars clause)])
@@ -136,8 +137,8 @@
         [e-bound? 'eavt]
         ;; Value known + ref type -> VAET (reverse ref lookup)
         [(and v-bound? attr (ref-type? attr)) 'vaet]
-        ;; Value known + indexed -> AVET (value lookup)
-        [(and v-bound? attr (indexed-attr? attr)) 'avet]
+        ;; Value known + scalar attr -> AVET (all scalar attrs now indexed)
+        [(and v-bound? attr (avet-eligible? attr)) 'avet]
         ;; Default: scan by attribute -> AEVT
         [else 'aevt])))
 
