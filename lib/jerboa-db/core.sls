@@ -7,7 +7,7 @@
 (library (jerboa-db core)
   (export
     ;; Connection
-    connect connection? db
+    connect close connection? db
 
     ;; Transactions
     transact! tempid tempid?
@@ -15,7 +15,7 @@
     tx-report-tx-data tx-report-tempids
 
     ;; Query
-    q
+    q explain-query
 
     ;; Pull API
     pull pull-many
@@ -30,7 +30,12 @@
     tx-range
 
     ;; Utilities
-    db-stats schema-for)
+    db-stats schema-for
+
+    ;; Internal constructors (used by backup/restore)
+    make-connection new-db-cache
+    connection-current-db-set!
+    connection-next-eid connection-next-eid-set!)
 
   (import (chezscheme)
           (jerboa-db datom)
@@ -53,21 +58,55 @@
             (mutable next-eid)     ;; next entity ID to assign (mutable cell)
             (mutable tx-log)       ;; list of tx-reports (most recent first)
             (mutable db-cache)     ;; LRU cache
-            path))                 ;; storage path (":memory:" for in-memory)
+            path                   ;; storage path (":memory:" for in-memory)
+            (mutable db-handles))) ;; LevelDB handles for cleanup (#f for in-memory)
 
   ;; ---- connect ----
+  ;; path = ":memory:" → in-memory RB-tree indices
+  ;; path = anything else → LevelDB-backed persistent indices
+
+  ;; Lazy loader for LevelDB backend — avoids loading the shared library
+  ;; until a persistent connection is actually requested.
+  (define leveldb-loaded? #f)
+  (define leveldb-make-index-set #f)
+  (define leveldb-close-index-set #f)
+
+  (define (ensure-leveldb!)
+    (unless leveldb-loaded?
+      (eval '(import (jerboa-db index leveldb)))
+      (set! leveldb-make-index-set
+            (eval 'make-leveldb-index-set))
+      (set! leveldb-close-index-set
+            (eval 'close-leveldb-index-set))
+      (set! leveldb-loaded? #t)))
 
   (define (connect path)
-    (let* ([schema (new-schema-registry)]
-           [indices (make-mem-index-set)]
-           [initial-db (make-db-value 0 indices schema #f #f #f)]
-           [conn (make-connection
-                   initial-db
-                   (list +first-user-attr-id+)  ;; next-eid cell (mutable pair)
-                   '()
-                   (new-db-cache 10000)
-                   path)])
-      conn))
+    (let-values ([(indices handles)
+                  (if (string=? path ":memory:")
+                      (values (make-mem-index-set) #f)
+                      (begin
+                        (ensure-leveldb!)
+                        (leveldb-make-index-set path)))])
+      (let* ([schema (new-schema-registry)]
+             [initial-db (make-db-value 0 indices schema #f #f #f)]
+             [conn (make-connection
+                     initial-db
+                     (list +first-user-attr-id+)
+                     '()
+                     (new-db-cache 10000)
+                     path
+                     handles)])
+        conn)))
+
+  ;; ---- close ----
+  ;; Close a persistent connection. No-op for in-memory.
+
+  (define (close conn)
+    (let ([handles (connection-db-handles conn)])
+      (when handles
+        (when leveldb-close-index-set
+          (leveldb-close-index-set handles))
+        (connection-db-handles-set! conn #f))))
 
   ;; ---- db: get current database value ----
 

@@ -9,11 +9,17 @@
     migrate! migration?
     make-rename-attr make-add-index make-remove-index
     make-merge-attr make-split-attr
-    migration-plan migration-dry-run)
+    migration-plan migration-dry-run
+
+    ;; Online reindexing
+    reindex! reindex-attribute!)
 
   (import (chezscheme)
           (jerboa-db datom)
           (jerboa-db schema)
+          (jerboa-db index protocol)
+          (jerboa-db index memory)
+          (jerboa-db history)
           (jerboa-db core))
 
   ;; ---- Migration operation types ----
@@ -175,5 +181,80 @@
       (display "Migration plan:\n")
       (for-each (lambda (step) (display (format "  ~a\n" step))) plan)
       plan))
+
+
+  ;; ---- Online reindexing ----
+
+  ;; reindex! rebuilds AEVT, AVET, and VAET from EAVT.
+  ;; EAVT is the source of truth; the other three indices are derived.
+  ;; This is useful after manual data manipulation or to compact indices.
+
+  (define (reindex! conn)
+    (let* ([current-db (db conn)]
+           [indices    (db-value-indices current-db)]
+           [schema     (db-value-schema current-db)]
+           [eavt       (index-set-eavt indices)]
+           [aevt       (index-set-aevt indices)]
+           [avet       (index-set-avet indices)]
+           [vaet       (index-set-vaet indices)]
+           [all-datoms (dbi-datoms eavt)])
+      ;; Rebuild fresh AEVT, AVET, VAET by creating new memory indices
+      ;; and copying them into the current index-set's underlying cells.
+      ;; Since dbi is a closure over a mutable tree-cell, we drain the old
+      ;; indices first then re-insert all datoms from EAVT.
+
+      ;; Step 1: drain AEVT, AVET, VAET
+      (for-each (lambda (d)
+                  (dbi-remove! aevt d)
+                  (dbi-remove! avet d)
+                  (dbi-remove! vaet d))
+                all-datoms)
+
+      ;; Step 2: re-insert all EAVT datoms into derived indices
+      (for-each
+        (lambda (d)
+          (dbi-add! aevt d)
+          (let ([attr (schema-lookup-by-id schema (datom-a d))])
+            (when (and attr (indexed-attr? attr))
+              (dbi-add! avet d))
+            (when (and attr (ref-type? attr))
+              (dbi-add! vaet d))))
+        all-datoms)
+
+      ;; Return count of datoms reindexed
+      (length all-datoms)))
+
+  ;; reindex-attribute! rebuilds AVET and VAET entries for a single attribute.
+  ;; Useful after adding or removing :db/index or :db/unique on an attribute.
+
+  (define (reindex-attribute! conn attr-ident)
+    (let* ([current-db (db conn)]
+           [indices    (db-value-indices current-db)]
+           [schema     (db-value-schema current-db)]
+           [attr       (schema-lookup-by-ident schema attr-ident)])
+      (unless attr
+        (error 'reindex-attribute! "Unknown attribute" attr-ident))
+      (let* ([aid  (db-attribute-id attr)]
+             [eavt (index-set-eavt indices)]
+             [avet (index-set-avet indices)]
+             [vaet (index-set-vaet indices)]
+             ;; Find all datoms for this attribute in EAVT
+             [lo   (make-datom 0 aid +min-val+ 0 #t)]
+             [hi   (make-datom (greatest-fixnum) aid +max-val+ (greatest-fixnum) #t)]
+             [attr-datoms (dbi-range eavt lo hi)])
+        ;; Remove old AVET/VAET entries for this attribute
+        (for-each (lambda (d)
+                    (dbi-remove! avet d)
+                    (dbi-remove! vaet d))
+                  attr-datoms)
+        ;; Re-insert according to current schema flags
+        (for-each
+          (lambda (d)
+            (when (indexed-attr? attr)
+              (dbi-add! avet d))
+            (when (ref-type? attr)
+              (dbi-add! vaet d)))
+          attr-datoms)
+        (length attr-datoms))))
 
 ) ;; end library

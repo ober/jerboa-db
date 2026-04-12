@@ -25,6 +25,18 @@
   (define (clause-bound-vars clause already-bound)
     (filter (lambda (v) (and (logic-var? v) (not (memq v already-bound))))
             (cond
+              ;; Not clause: (not sub-clause ...) — binds nothing (filter only)
+              [(and (pair? clause) (eq? (car clause) 'not))
+               '()]
+              ;; Or clause: (or alt ...) — binds the union of what alternatives bind
+              [(and (pair? clause) (eq? (car clause) 'or))
+               (if (null? (cdr clause)) '()
+                   ;; Take the intersection of bound vars across alternatives
+                   (let ([alt-vars (map (lambda (alt) (clause-bound-vars alt already-bound))
+                                        (cdr clause))])
+                     (fold-left (lambda (acc vars)
+                                  (filter (lambda (v) (memq v vars)) acc))
+                                (car alt-vars) (cdr alt-vars))))]
               ;; Data pattern: (?e attr ?v) or (?e attr ?v ?tx) or (?e attr ?v ?tx ?op)
               [(and (pair? clause) (not (pair? (car clause))))
                (filter logic-var? clause)]
@@ -42,6 +54,9 @@
   ;; Variables used (referenced) by a clause
   (define (clause-used-vars clause)
     (cond
+      ;; Not/or: collect vars from sub-clauses
+      [(and (pair? clause) (memq (car clause) '(not or)))
+       (apply append (map clause-used-vars (cdr clause)))]
       [(and (pair? clause) (not (pair? (car clause))))
        (filter logic-var? clause)]
       [(and (pair? clause) (pair? (car clause)))
@@ -53,6 +68,16 @@
 
   (define (score-clause clause bound-vars schema)
     (cond
+      ;; Not clause: should come after its sub-clause vars are bound.
+      ;; Score low so it's placed late (it's a filter).
+      [(and (pair? clause) (eq? (car clause) 'not))
+       (let ([used (clause-used-vars clause)])
+         (if (for-all (lambda (v) (memq v bound-vars)) used) 3 -100))]
+      ;; Or clause: score like the best alternative
+      [(and (pair? clause) (eq? (car clause) 'or))
+       (let ([alt-scores (map (lambda (alt) (score-clause alt bound-vars schema))
+                               (cdr clause))])
+         (if (null? alt-scores) 0 (apply max alt-scores)))]
       ;; Data pattern: (?e attr ?v ...)
       [(and (pair? clause) (not (pair? (car clause)))
             (>= (length clause) 3))

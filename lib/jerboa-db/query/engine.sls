@@ -6,7 +6,7 @@
 ;;; function clauses, aggregation, and rules.
 
 (library (jerboa-db query engine)
-  (export query-db parse-query)
+  (export query-db parse-query explain-query)
 
   (import (chezscheme)
           (jerboa-db datom)
@@ -230,6 +230,14 @@
     ;; ((fn args...) ?result) — nested list + result variable
     (and (pair? clause) (pair? (car clause)) (pair? (cdr clause))))
 
+  (define (not-clause? clause)
+    ;; (not sub-clause ...) — negation
+    (and (pair? clause) (eq? (car clause) 'not)))
+
+  (define (or-clause? clause)
+    ;; (or alt1 alt2 ...) — disjunction
+    (and (pair? clause) (eq? (car clause) 'or)))
+
   (define (rule-invocation? clause rules-ht)
     ;; (rule-name args...) where rule-name is in the rule registry
     (and (pair? clause)
@@ -254,6 +262,10 @@
 
   (define (evaluate-single-clause db clause bindings schema rules-ht)
     (cond
+      [(not-clause? clause)
+       (evaluate-not-clause db clause bindings schema rules-ht)]
+      [(or-clause? clause)
+       (evaluate-or-clause db clause bindings schema rules-ht)]
       [(data-pattern? clause)
        (evaluate-data-pattern db clause bindings schema)]
       [(predicate-clause? clause)
@@ -274,6 +286,29 @@
       (apply append
         (map (lambda (alt-clauses)
                (evaluate-where-clauses db alt-clauses (list bindings) schema rules-ht))
+             alternatives))))
+
+  ;; ---- Not clause evaluation ----
+  ;; (not sub-clause ...) — exclude bindings for which sub-clauses match.
+
+  (define (evaluate-not-clause db clause bindings schema rules-ht)
+    (let* ([sub-clauses (cdr clause)]
+           ;; Evaluate sub-clauses starting from current bindings
+           [results (evaluate-where-clauses db sub-clauses (list bindings) schema rules-ht)])
+      ;; If sub-query produces any results, this binding is excluded
+      (if (null? results)
+          (list bindings)   ;; not matched -> keep this binding
+          '())))            ;; matched -> exclude
+
+  ;; ---- Or clause evaluation ----
+  ;; (or alt1 alt2 ...) — union of bindings from each alternative.
+
+  (define (evaluate-or-clause db clause bindings schema rules-ht)
+    (let ([alternatives (cdr clause)])
+      (apply append
+        (map (lambda (alt)
+               ;; Each alternative is a single clause
+               (evaluate-single-clause db alt bindings schema rules-ht))
              alternatives))))
 
   ;; ---- Find clause processing ----
@@ -361,17 +396,69 @@
            [rules-ht (parsed-query-rules parsed)]
            ;; Build initial bindings from inputs
            ;; $ = db (implicit), % = rules, other = user inputs
+           ;; Input var specs:
+           ;;   ?x       — scalar: bind ?x to the input value
+           ;;   (?x ...) — collection: input is a list, produce one binding per value
+           ;;   [?x ?y]  — tuple: input is a single tuple, bind multiple vars
+           ;;   [[?x ?y]]— relation: input is a list of tuples
            [input-bindings
-             (let loop ([ivs in-vars] [inps inputs] [bindings empty-bindings])
+             (let loop ([ivs in-vars] [inps inputs]
+                        [bindings-list (list empty-bindings)])
                (cond
-                 [(null? ivs) bindings]
-                 [(eq? (car ivs) '$) (loop (cdr ivs) inps bindings)]
+                 [(null? ivs) bindings-list]
+                 [(eq? (car ivs) '$) (loop (cdr ivs) inps bindings-list)]
                  [(eq? (car ivs) '%)
-                  ;; % means rules are provided as the next input
-                  (loop (cdr ivs) (cdr inps) bindings)]
+                  (loop (cdr ivs) (cdr inps) bindings-list)]
+                 ;; Collection binding: (?x ...) — spec is a list ending with ...
+                 [(and (pair? (car ivs))
+                       (>= (length (car ivs)) 2)
+                       (eq? (list-ref (car ivs) (- (length (car ivs)) 1)) '...))
+                  (let* ([var (caar ivs)]
+                         [vals (car inps)]
+                         [new-bindings-list
+                           (apply append
+                             (map (lambda (bindings)
+                                    (map (lambda (v) (binding-set bindings var v)) vals))
+                                  bindings-list))])
+                    (loop (cdr ivs) (cdr inps) new-bindings-list))]
+                 ;; Relation binding: ((?x ?y ...)) — spec is a list of one list of vars
+                 [(and (pair? (car ivs))
+                       (= (length (car ivs)) 1)
+                       (pair? (caar ivs))
+                       (for-all logic-var? (caar ivs)))
+                  (let* ([vars (caar ivs)]
+                         [tuples (car inps)]
+                         [new-bindings-list
+                           (apply append
+                             (map (lambda (bindings)
+                                    (map (lambda (tuple)
+                                           (let add-vars ([vs vars] [ts tuple] [b bindings])
+                                             (if (null? vs) b
+                                                 (add-vars (cdr vs) (cdr ts)
+                                                           (binding-set b (car vs) (car ts))))))
+                                         tuples))
+                                  bindings-list))])
+                    (loop (cdr ivs) (cdr inps) new-bindings-list))]
+                 ;; Tuple binding: (?x ?y ...) — spec is a list of vars (no ... suffix)
+                 [(and (pair? (car ivs))
+                       (for-all logic-var? (car ivs)))
+                  (let* ([vars (car ivs)]
+                         [tuple (car inps)]
+                         [new-bindings-list
+                           (map (lambda (bindings)
+                                  (let add-vars ([vs vars] [ts tuple] [b bindings])
+                                    (if (null? vs) b
+                                        (add-vars (cdr vs) (cdr ts)
+                                                  (binding-set b (car vs) (car ts))))))
+                                bindings-list)])
+                    (loop (cdr ivs) (cdr inps) new-bindings-list))]
+                 ;; Scalar binding: ?x
                  [else
-                  (loop (cdr ivs) (cdr inps)
-                        (binding-set bindings (car ivs) (car inps)))]))]
+                  (let ([new-bindings-list
+                          (map (lambda (bindings)
+                                 (binding-set bindings (car ivs) (car inps)))
+                               bindings-list)])
+                    (loop (cdr ivs) (cdr inps) new-bindings-list))]))]
            ;; Parse rules from % input if present
            [rules-from-input
              (let ([%-pos (list-index (lambda (v) (eq? v '%)) in-vars)])
@@ -379,12 +466,14 @@
                    (parse-rules (list-ref inputs (- %-pos 1)))  ;; -1 for $
                    rules-ht))]
            ;; Reorder clauses for optimal execution
-           [bound-at-start (map car input-bindings)]
+           ;; input-bindings is now a list of binding-sets
+           [bound-at-start (if (null? input-bindings) '()
+                               (map car (car input-bindings)))]
            [ordered-clauses (reorder-clauses where-clauses bound-at-start schema)]
            ;; Execute
            [result-bindings
              (evaluate-where-clauses db ordered-clauses
-                                     (list input-bindings) schema rules-from-input)])
+                                     input-bindings schema rules-from-input)])
       (extract-find-results find-vars result-bindings)))
 
   ;; Helper: find position of element in list
@@ -393,5 +482,56 @@
       (cond [(null? l) #f]
             [(pred (car l)) i]
             [else (loop (cdr l) (+ i 1))])))
+
+  ;; ---- Query explain ----
+  ;; Returns the query plan (clause ordering, chosen indices) without executing.
+
+  (define (explain-query query-form db-val . inputs)
+    (let* ([parsed (parse-query query-form)]
+           [schema (db-value-schema db-val)]
+           [find-vars (parsed-query-find-vars parsed)]
+           [in-vars (parsed-query-in-vars parsed)]
+           [where-clauses (parsed-query-where-clauses parsed)]
+           ;; Determine initially bound variables from inputs
+           [bound-at-start
+             (let loop ([ivs in-vars] [inps inputs] [bound '()])
+               (cond
+                 [(null? ivs) bound]
+                 [(eq? (car ivs) '$) (loop (cdr ivs) inps bound)]
+                 [(eq? (car ivs) '%)  (loop (cdr ivs) (cdr inps) bound)]
+                 [(pair? (car ivs))
+                  ;; Collection/tuple/relation: extract var names
+                  (let ([vars (filter logic-var?
+                                (let flatten ([x (car ivs)])
+                                  (cond [(pair? x) (append (flatten (car x)) (flatten (cdr x)))]
+                                        [(null? x) '()]
+                                        [else (list x)])))])
+                    (loop (cdr ivs) (cdr inps) (append vars bound)))]
+                 [else
+                  (loop (cdr ivs) (cdr inps) (cons (car ivs) bound))]))]
+           [ordered-clauses (reorder-clauses where-clauses bound-at-start schema)])
+      ;; Build plan: for each clause, describe it and the chosen index
+      (let build-plan ([clauses ordered-clauses] [bound bound-at-start] [plan '()])
+        (if (null? clauses)
+            `((find ,@find-vars)
+              (in ,@in-vars)
+              (plan ,@(reverse plan)))
+            (let* ([clause (car clauses)]
+                   [step
+                     (cond
+                       [(not-clause? clause)
+                        `(not-filter ,clause)]
+                       [(or-clause? clause)
+                        `(or-union ,clause)]
+                       [(data-pattern? clause)
+                        (let ([idx (choose-index clause bound schema)])
+                          `(scan ,idx ,clause))]
+                       [(predicate-clause? clause)
+                        `(filter ,clause)]
+                       [(function-clause? clause)
+                        `(compute ,clause)]
+                       [else `(unknown ,clause)])]
+                   [new-bound (append (clause-bound-vars clause bound) bound)])
+              (build-plan (cdr clauses) new-bound (cons step plan)))))))
 
 ) ;; end library

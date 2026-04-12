@@ -263,6 +263,218 @@
          [results (q '((find ?age) (where (?e person/age ?age))) (db conn))])
     (assert-equal (caar results) 31)))
 
+;; ---- Not clause ----
+
+(test "not clause excludes matching entities"
+  (let* ([conn (make-person-db)]
+         [_ (transact! conn
+              (list
+                `((db/ident . person/banned)
+                  (db/valueType . db.type/boolean)
+                  (db/cardinality . db.cardinality/one))))]
+         [_ (transact! conn
+              (list
+                `((person/name . "Alice") (person/age . 30))
+                `((person/name . "Bob") (person/age . 25) (person/banned . #t))
+                `((person/name . "Carol") (person/age . 42))))]
+         [results (q '((find ?name)
+                       (where (?e person/name ?name)
+                              (not (?e person/banned #t))))
+                     (db conn))])
+    (assert-equal (length results) 2)
+    ;; Alice and Carol should be present, Bob excluded
+    (assert-true (member '("Alice") results))
+    (assert-true (member '("Carol") results))
+    (assert-false (member '("Bob") results))))
+
+;; ---- Or clause ----
+
+(test "or clause unions alternatives"
+  (let* ([conn (make-person-db)]
+         [_ (transact! conn
+              (list
+                `((person/name . "Alice") (person/age . 30))
+                `((person/name . "Bob") (person/age . 25))
+                `((person/name . "Carol") (person/age . 42))))]
+         [results (q '((find ?name)
+                       (where (or (?e person/name "Alice")
+                                  (?e person/name "Carol"))
+                              (?e person/name ?name)))
+                     (db conn))])
+    (assert-equal (length results) 2)
+    (assert-true (member '("Alice") results))
+    (assert-true (member '("Carol") results))))
+
+;; ---- Collection binding ----
+
+(test "collection binding with (?x ...)"
+  (let* ([conn (make-person-db)]
+         [_ (transact! conn
+              (list
+                `((person/name . "Alice") (person/age . 30))
+                `((person/name . "Bob") (person/age . 25))
+                `((person/name . "Carol") (person/age . 42))))]
+         [results (q '((find ?name ?age)
+                       (in $ (?name ...))
+                       (where (?e person/name ?name)
+                              (?e person/age ?age)))
+                     (db conn) '("Alice" "Carol"))])
+    (assert-equal (length results) 2)
+    (assert-true (member '("Alice" 30) results))
+    (assert-true (member '("Carol" 42) results))))
+
+;; ---- Tuple binding ----
+
+(test "tuple binding with (?x ?y)"
+  (let* ([conn (make-person-db)]
+         [_ (transact! conn
+              (list
+                `((person/name . "Alice") (person/age . 30))
+                `((person/name . "Bob") (person/age . 25))))]
+         [results (q '((find ?name ?age)
+                       (in $ (?name ?min-age))
+                       (where (?e person/name ?name)
+                              (?e person/age ?age)
+                              ((>= ?age ?min-age))))
+                     (db conn) '("Alice" 25))])
+    (assert-equal (length results) 1)
+    (assert-equal (car results) '("Alice" 30))))
+
+;; ---- Relation binding ----
+
+(test "relation binding with ((?x ?y))"
+  (let* ([conn (make-person-db)]
+         [_ (transact! conn
+              (list
+                `((person/name . "Alice") (person/age . 30))
+                `((person/name . "Bob") (person/age . 25))
+                `((person/name . "Carol") (person/age . 42))))]
+         [results (q '((find ?name ?age)
+                       (in $ ((?name ?age)))
+                       (where (?e person/name ?name)
+                              (?e person/age ?age)))
+                     (db conn) '(("Alice" 30) ("Carol" 42)))])
+    (assert-equal (length results) 2)
+    (assert-true (member '("Alice" 30) results))
+    (assert-true (member '("Carol" 42) results))))
+
+;; ---- Built-in predicates ----
+
+(test "built-in predicates zero? pos? neg? even? odd?"
+  (let* ([conn (make-person-db)]
+         [_ (transact! conn
+              (list
+                `((person/name . "Alice") (person/age . 30))
+                `((person/name . "Bob") (person/age . 25))
+                `((person/name . "Carol") (person/age . 42))))]
+         [even-results (q '((find ?name)
+                           (where (?e person/name ?name)
+                                  (?e person/age ?age)
+                                  ((even? ?age))))
+                         (db conn))]
+         [odd-results (q '((find ?name)
+                          (where (?e person/name ?name)
+                                 (?e person/age ?age)
+                                 ((odd? ?age))))
+                        (db conn))])
+    (assert-equal (length even-results) 2)  ;; 30 and 42 are even
+    (assert-equal (length odd-results) 1)))  ;; 25 is odd
+
+(test "string predicates"
+  (let* ([conn (make-person-db)]
+         [_ (transact! conn
+              (list
+                `((person/name . "Alice"))
+                `((person/name . "Alicia"))
+                `((person/name . "Bob"))))]
+         [results (q '((find ?name)
+                       (where (?e person/name ?name)
+                              ((string-starts-with? ?name "Ali"))))
+                     (db conn))])
+    (assert-equal (length results) 2)))
+
+;; ---- Built-in functions ----
+
+(test "built-in functions str, upper-case, inc"
+  (let* ([conn (make-person-db)]
+         [_ (transact! conn
+              (list `((person/name . "Alice") (person/age . 30))))]
+         [results (q '((find ?upper ?next-age)
+                       (where (?e person/name ?name)
+                              (?e person/age ?age)
+                              ((upper-case ?name) ?upper)
+                              ((inc ?age) ?next-age)))
+                     (db conn))])
+    (assert-equal (length results) 1)
+    (assert-equal (car results) '("ALICE" 31))))
+
+;; ---- Aggregates ----
+
+(test "count-distinct aggregate"
+  (let* ([conn (make-person-db)]
+         [_ (transact! conn
+              (list
+                `((person/name . "Alice") (person/age . 30))
+                `((person/name . "Bob") (person/age . 30))
+                `((person/name . "Carol") (person/age . 42))))]
+         [results (q '((find (count-distinct ?age))
+                       (where (?e person/age ?age)))
+                     (db conn))])
+    (assert-equal (caar results) 2)))  ;; 30 and 42
+
+(test "median aggregate"
+  (let* ([conn (make-person-db)]
+         [_ (transact! conn
+              (list
+                `((person/name . "Alice") (person/age . 30))
+                `((person/name . "Bob") (person/age . 25))
+                `((person/name . "Carol") (person/age . 42))))]
+         [results (q '((find (median ?age))
+                       (where (?e person/age ?age)))
+                     (db conn))])
+    (assert-equal (caar results) 30)))  ;; median of 25,30,42
+
+;; ---- Lookup refs ----
+
+(test "lookup ref in transaction"
+  (let* ([conn (make-person-db)]
+         [_ (transact! conn
+              (list
+                `((db/ident . person/email)
+                  (db/valueType . db.type/string)
+                  (db/cardinality . db.cardinality/one)
+                  (db/unique . db.unique/identity)
+                  (db/index . #t))))]
+         [_ (transact! conn
+              (list
+                `((person/name . "Alice") (person/email . "alice@example.com") (person/age . 30))))]
+         ;; Update using lookup ref
+         [_ (transact! conn
+              (list
+                `((db/id . (person/email "alice@example.com")) (person/age . 31))))]
+         [results (q '((find ?name ?age)
+                       (where (?e person/name ?name)
+                              (?e person/age ?age)))
+                     (db conn))])
+    (assert-equal (length results) 1)
+    (assert-equal (car results) '("Alice" 31))))
+
+;; ---- Explain query ----
+
+(test "explain-query returns plan without executing"
+  (let* ([conn (make-person-db)]
+         [plan (explain-query
+                 '((find ?name ?age)
+                   (where (?e person/name ?name)
+                          (?e person/age ?age)
+                          ((> ?age 30))))
+                 (db conn))])
+    (assert-true (pair? plan))
+    ;; Plan should have find, in, and plan sections
+    (assert-equal (caar plan) 'find)
+    (assert-equal (caadr plan) 'in)
+    (assert-equal (caaddr plan) 'plan)))
+
 ;; ============================================================
 ;; Report
 ;; ============================================================

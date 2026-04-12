@@ -63,7 +63,24 @@
 
       (define (resolve-eid raw-eid)
         ;; Resolve a tempid to a permanent eid, or return raw-eid if already permanent.
+        ;; Also handles lookup refs: (attr-ident value) — resolves to existing entity.
         (cond
+          [(and (pair? raw-eid)
+                (symbol? (car raw-eid))
+                (= (length raw-eid) 2))
+           ;; Lookup ref: (attr-ident value)
+           (let* ([attr-ident (car raw-eid)]
+                  [val (cadr raw-eid)]
+                  [attr (schema-lookup-by-ident schema attr-ident)])
+             (unless attr
+               (error 'transact! "Unknown attribute in lookup ref" attr-ident))
+             (unless (db-attribute-unique attr)
+               (error 'transact! "Lookup ref attribute must be unique" attr-ident))
+             (let ([found-eid (find-entity-by-unique attr val)])
+               (unless found-eid
+                 (error 'transact!
+                   (format "Lookup ref found no entity: ~a = ~a" attr-ident val)))
+               found-eid))]
           [(tempid? raw-eid)
            (let ([found (assv raw-eid tempid-map)])
              (if found
@@ -207,10 +224,34 @@
                     (let ([old (current-value eid aid)])
                       (when (and old (not (equal? (datom-v old) cval)))
                         (emit-datom! eid aid (datom-v old) #f))))
-                  ;; Handle ref values (resolve tempids in values)
-                  (let ([final-val (if (and (ref-type? attr) (tempid? cval))
-                                       (resolve-eid cval)
-                                       cval)])
+                  ;; Handle ref values:
+                  ;; - tempids: resolve to permanent eid
+                  ;; - nested maps (alists): recursively process, use child eid
+                  ;; - lookup refs: resolve via unique attribute
+                  (let ([final-val
+                          (cond
+                            ;; Nested map: ref-type + component + value is an alist
+                            [(and (ref-type? attr)
+                                  (db-attribute-is-component? attr)
+                                  (pair? cval)
+                                  (pair? (car cval))
+                                  (symbol? (caar cval)))
+                             ;; Process nested entity map, get its eid
+                             (let ([child-eid (resolve-eid (cond [(assq 'db/id cval) => cdr]
+                                                                  [else #f]))])
+                               ;; Process the nested map
+                               (process-entity-map!
+                                 (cons (cons 'db/id child-eid)
+                                       (filter (lambda (p) (not (eq? (car p) 'db/id))) cval)))
+                               child-eid)]
+                            ;; Lookup ref in value position
+                            [(and (ref-type? attr) (pair? cval)
+                                  (symbol? (car cval)) (= (length cval) 2))
+                             (resolve-eid cval)]
+                            ;; Tempid in value position
+                            [(and (ref-type? attr) (tempid? cval))
+                             (resolve-eid cval)]
+                            [else cval])])
                     (emit-datom! eid aid final-val #t)))))
             other-pairs)))
 
@@ -219,13 +260,21 @@
                [attr (schema-lookup-by-ident schema attr-ident)])
           (unless attr (error 'transact! "Unknown attribute" attr-ident))
           (let* ([aid (db-attribute-id attr)]
-                 [cval (coerce-value (db-attribute-value-type attr) val)])
-            (check-unique-value! attr eid cval)
+                 [cval (coerce-value (db-attribute-value-type attr) val)]
+                 ;; Handle lookup refs and tempids in ref values
+                 [final-val (cond
+                              [(and (ref-type? attr) (pair? cval)
+                                    (symbol? (car cval)) (= (length cval) 2))
+                               (resolve-eid cval)]
+                              [(and (ref-type? attr) (tempid? cval))
+                               (resolve-eid cval)]
+                              [else cval])])
+            (check-unique-value! attr eid final-val)
             (when (cardinality-one? attr)
               (let ([old (current-value eid aid)])
-                (when (and old (not (equal? (datom-v old) cval)))
+                (when (and old (not (equal? (datom-v old) final-val)))
                   (emit-datom! eid aid (datom-v old) #f))))
-            (emit-datom! eid aid cval #t))))
+            (emit-datom! eid aid final-val #t))))
 
       (define (process-retract! eid attr-ident val)
         (let ([attr (schema-lookup-by-ident schema attr-ident)])
