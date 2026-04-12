@@ -1,0 +1,276 @@
+(import (jerboa prelude)
+        (jerboa-db core)
+        (jerboa-db datom)
+        (jerboa-db schema)
+        (jerboa-db history)
+        (jerboa-db entity))
+
+;; ---- Test harness ----
+
+(def test-count 0)
+(def pass-count 0)
+(def fail-count 0)
+
+(defrule (test name body ...)
+  (begin
+    (set! test-count (+ test-count 1))
+    (guard (exn [#t (set! fail-count (+ fail-count 1))
+                    (displayln "FAIL: " name)
+                    (displayln "  Error: " (if (message-condition? exn)
+                                               (condition-message exn)
+                                               exn))])
+      body ...
+      (set! pass-count (+ pass-count 1))
+      (displayln "PASS: " name))))
+
+(defrule (assert-equal actual expected)
+  (let ([a actual] [e expected])
+    (unless (equal? a e)
+      (error 'assert-equal
+        (format "Expected ~s but got ~s" e a)))))
+
+(defrule (assert-true expr)
+  (unless expr
+    (error 'assert-true "Expected true")))
+
+(defrule (assert-false expr)
+  (when expr
+    (error 'assert-false "Expected false")))
+
+;; Helper: setup a fresh conn with person schema
+(def (make-person-db)
+  (let ([conn (connect ":memory:")])
+    (transact! conn
+      (list
+        `((db/ident . person/name)
+          (db/valueType . db.type/string)
+          (db/cardinality . db.cardinality/one))
+        `((db/ident . person/age)
+          (db/valueType . db.type/long)
+          (db/cardinality . db.cardinality/one))))
+    conn))
+
+;; ============================================================
+;; Tests
+;; ============================================================
+
+(displayln "")
+(displayln "=== Jerboa-DB Core Tests ===")
+(displayln "")
+
+;; ---- Connection and basic setup ----
+
+(test "connect creates in-memory database"
+  (let* ([conn (connect ":memory:")]
+         [d (db conn)])
+    (assert-true (connection? conn))
+    (assert-true (db-value? d))
+    (assert-equal (db-value-basis-tx d) 0)))
+
+;; ---- Schema installation ----
+
+(test "transact schema attributes"
+  (let* ([conn (connect ":memory:")]
+         [_ (transact! conn
+              (list
+                `((db/ident . person/name)
+                  (db/valueType . db.type/string)
+                  (db/cardinality . db.cardinality/one))
+                `((db/ident . person/age)
+                  (db/valueType . db.type/long)
+                  (db/cardinality . db.cardinality/one))
+                `((db/ident . person/email)
+                  (db/valueType . db.type/string)
+                  (db/cardinality . db.cardinality/one)
+                  (db/unique . db.unique/identity)
+                  (db/index . #t))))]
+         [d (db conn)]
+         [schema (db-value-schema d)]
+         [attr (schema-lookup-by-ident schema 'person/name)])
+    (assert-true (db-attribute? attr))
+    (assert-equal (db-attribute-value-type attr) 'db.type/string)
+    (assert-equal (db-attribute-cardinality attr) 'db.cardinality/one)))
+
+;; ---- Entity creation ----
+
+(test "transact entities with tempids"
+  (let* ([conn (make-person-db)]
+         [tid1 (tempid)]
+         [tid2 (tempid)]
+         [report (transact! conn
+                   (list
+                     `((db/id . ,tid1) (person/name . "Alice") (person/age . 30))
+                     `((db/id . ,tid2) (person/name . "Bob") (person/age . 25))))]
+         [alice-eid (cdr (assv tid1 (tx-report-tempids report)))]
+         [bob-eid (cdr (assv tid2 (tx-report-tempids report)))])
+    (assert-true (tx-report? report))
+    (assert-true (pair? (tx-report-tempids report)))
+    (assert-true (> alice-eid 0))
+    (assert-true (> bob-eid 0))
+    (assert-true (not (= alice-eid bob-eid)))))
+
+;; ---- Datalog queries ----
+
+(test "basic two-clause query"
+  (let* ([conn (make-person-db)]
+         [_ (transact! conn
+              (list
+                `((person/name . "Alice") (person/age . 30))
+                `((person/name . "Bob") (person/age . 25))
+                `((person/name . "Carol") (person/age . 42))))]
+         [results (q '((find ?name ?age)
+                       (where (?e person/name ?name)
+                              (?e person/age ?age)
+                              ((> ?age 30))))
+                     (db conn))])
+    (assert-equal (length results) 1)
+    (assert-equal (car results) '("Carol" 42))))
+
+(test "parameterized query with :in"
+  (let* ([conn (make-person-db)]
+         [_ (transact! conn
+              (list
+                `((person/name . "Alice") (person/age . 30))
+                `((person/name . "Bob") (person/age . 25))
+                `((person/name . "Carol") (person/age . 42))))]
+         [results (q '((find ?name)
+                       (in $ ?min-age)
+                       (where (?e person/name ?name)
+                              (?e person/age ?age)
+                              ((>= ?age ?min-age))))
+                     (db conn) 30)])
+    (assert-equal (length results) 2)))
+
+;; ---- Cardinality/one auto-retraction ----
+
+(test "cardinality/one auto-retracts old value"
+  (let* ([conn (make-person-db)]
+         [tid (tempid)]
+         [r1 (transact! conn (list `((db/id . ,tid) (person/name . "Alice"))))]
+         [eid (cdr (assv tid (tx-report-tempids r1)))]
+         [_ (transact! conn (list `((db/id . ,eid) (person/name . "Alicia"))))]
+         [results (q '((find ?name) (where (?e person/name ?name))) (db conn))])
+    (assert-equal (length results) 1)
+    (assert-equal (caar results) "Alicia")))
+
+;; ---- Pull API ----
+
+(test "pull simple attributes"
+  (let* ([conn (make-person-db)]
+         [tid (tempid)]
+         [r (transact! conn
+              (list `((db/id . ,tid) (person/name . "Alice") (person/age . 30))))]
+         [eid (cdr (assv tid (tx-report-tempids r)))]
+         [result (pull (db conn) '(person/name person/age) eid)])
+    (assert-equal (cdr (assq 'person/name result)) "Alice")
+    (assert-equal (cdr (assq 'person/age result)) 30)))
+
+;; ---- Time-travel ----
+
+(test "as-of returns historical state"
+  (let* ([conn (make-person-db)]
+         [tid (tempid)]
+         [r1 (transact! conn (list `((db/id . ,tid) (person/name . "Alice"))))]
+         [eid (cdr (assv tid (tx-report-tempids r1)))]
+         [tx1 (db-value-basis-tx (tx-report-db-after r1))]
+         [_ (transact! conn (list `((db/id . ,eid) (person/name . "Alicia"))))]
+         [current (q '((find ?name) (where (?e person/name ?name))) (db conn))]
+         [historical (q '((find ?name) (where (?e person/name ?name)))
+                        (as-of (db conn) tx1))])
+    (assert-equal (caar current) "Alicia")
+    (assert-equal (caar historical) "Alice")))
+
+;; ---- Entity API ----
+
+(test "entity lazy access"
+  (let* ([conn (make-person-db)]
+         [tid (tempid)]
+         [r (transact! conn
+              (list `((db/id . ,tid) (person/name . "Alice") (person/age . 30))))]
+         [eid (cdr (assv tid (tx-report-tempids r)))]
+         [ent (entity (db conn) eid)])
+    (assert-true (entity-map? ent))
+    (assert-equal (entity-get ent 'person/name) "Alice")
+    (assert-equal (entity-get ent 'person/age) 30)))
+
+;; ---- Retraction ----
+
+(test "explicit retraction"
+  (let* ([conn (make-person-db)]
+         [tid (tempid)]
+         [r (transact! conn (list `((db/id . ,tid) (person/name . "Alice"))))]
+         [eid (cdr (assv tid (tx-report-tempids r)))]
+         [_ (transact! conn (list `(db/retract ,eid person/name "Alice")))]
+         [results (q '((find ?name) (where (?e person/name ?name))) (db conn))])
+    (assert-equal (length results) 0)))
+
+;; ---- Entity retraction ----
+
+(test "retract entire entity"
+  (let* ([conn (make-person-db)]
+         [tid (tempid)]
+         [r (transact! conn
+              (list `((db/id . ,tid) (person/name . "Alice") (person/age . 30))))]
+         [eid (cdr (assv tid (tx-report-tempids r)))]
+         [_ (transact! conn (list `(db/retractEntity ,eid)))]
+         [results (q '((find ?name) (where (?e person/name ?name))) (db conn))])
+    (assert-equal (length results) 0)))
+
+;; ---- History ----
+
+(test "history shows all datoms including retracted"
+  (let* ([conn (make-person-db)]
+         [tid (tempid)]
+         [r (transact! conn (list `((db/id . ,tid) (person/name . "Alice"))))]
+         [eid (cdr (assv tid (tx-report-tempids r)))]
+         [_ (transact! conn (list `((db/id . ,eid) (person/name . "Alicia"))))]
+         [results (q '((find ?name ?tx ?added)
+                       (where (?e person/name ?name ?tx ?added)))
+                     (history (db conn)))])
+    ;; Should have at least 3 datoms: Alice assert, Alice retract, Alicia assert
+    (assert-true (>= (length results) 3))))
+
+;; ---- Aggregation ----
+
+(test "count aggregate"
+  (let* ([conn (make-person-db)]
+         [_ (transact! conn
+              (list
+                `((person/name . "Alice") (person/age . 30))
+                `((person/name . "Bob") (person/age . 25))
+                `((person/name . "Carol") (person/age . 42))))]
+         [results (q '((find (count ?e))
+                       (where (?e person/name ?name)))
+                     (db conn))])
+    (assert-equal (caar results) 3)))
+
+;; ---- db-stats ----
+
+(test "db-stats returns index sizes"
+  (let* ([conn (make-person-db)]
+         [_ (transact! conn (list `((person/name . "Alice"))))]
+         [stats (db-stats conn)])
+    (assert-true (> (cdr (assq 'eavt-count stats)) 0))))
+
+;; ---- Compare-and-swap ----
+
+(test "CAS succeeds when current value matches"
+  (let* ([conn (make-person-db)]
+         [tid (tempid)]
+         [r (transact! conn (list `((db/id . ,tid) (person/age . 30))))]
+         [eid (cdr (assv tid (tx-report-tempids r)))]
+         [_ (transact! conn (list `(db/cas ,eid person/age 30 31)))]
+         [results (q '((find ?age) (where (?e person/age ?age))) (db conn))])
+    (assert-equal (caar results) 31)))
+
+;; ============================================================
+;; Report
+;; ============================================================
+
+(displayln "")
+(displayln "=== Results ===")
+(displayln (str "Total: " test-count " | Passed: " pass-count " | Failed: " fail-count))
+(displayln "")
+
+(when (> fail-count 0)
+  (exit 1))
