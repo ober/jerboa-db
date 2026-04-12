@@ -7,7 +7,7 @@ CHEZ_EXT_DIR ?= $(HOME)/src
 CHEZ_EXT_LIBDIRS = $(CHEZ_EXT_DIR)/chez-lmdb:$(CHEZ_EXT_DIR)/chez-duckdb
 FULL_LIBDIRS = $(LIBDIRS):$(CHEZ_EXT_LIBDIRS)
 
-.PHONY: test build clean check
+.PHONY: test build clean check bench bench-quick
 
 # Run the core test suite (in-memory, no FFI deps)
 test:
@@ -32,6 +32,14 @@ check:
 		$(SCHEME) --libdirs "$(LIBDIRS)" --script /dev/null 2>&1 | head -5 || true; \
 	done
 	@echo "Check complete."
+
+# Full load test (all 7 scenarios at full scale)
+bench:
+	$(SCHEME) --libdirs "$(LIBDIRS)" --script benchmarks/load-test.ss
+
+# Quick load test (1/10 scale — runs in under 5s)
+bench-quick:
+	$(SCHEME) --libdirs "$(LIBDIRS)" --script benchmarks/load-test.ss --quick
 
 # Clean compiled artifacts
 clean:
