@@ -803,11 +803,12 @@ the connection registry handle multiple named databases.
 
 ### Infrastructure (Phase 6: Raft Distribution)
 
-**Files:** `lib/jerboa-db/replication.ss`, `lib/jerboa-db/cluster.ss`
+**Files:** `lib/jerboa-db/replication.ss`, `lib/jerboa-db/cluster.ss`, `lib/jerboa-db/peer.ss`
 
-The in-process Raft layer is complete.  Multi-node replication works inside a
-single OS process using `(std raft)` channels.  What remains is a TCP/TLS
-transport adapter to span processes or machines (Phase 6.3).
+The in-process Raft layer and the HTTP peer client are complete.  Multi-node
+replication works inside a single OS process using `(std raft)` channels.
+What remains is a TCP/TLS transport adapter to span processes or machines
+(Phase 6.3) and local db-value caching in the peer client (Phase 6.4).
 
 #### What's implemented
 
@@ -2078,23 +2079,27 @@ Built on `(std net fiber-httpd)` + `(std net router)` + `(std net fiber-ws)`.
 One fiber per connection.  Queries run against immutable db snapshots so they
 never block the transactor.
 
-#### 5.2 Client Library
+#### 5.2 Client Library ✅ Functional (HTTP-based)
+
+**File:** `lib/jerboa-db/peer.ss` — see Phase 6.4 for full documentation.
 
 ```scheme
-;; lib/jerboa-db/peer.ss
+(import (jerboa-db peer))
 
-;; Remote peer — connects to a Jerboa-DB server
-(def remote-conn (connect-remote "http://localhost:8484"))
+;; Single server:
+(def conn (connect-remote "http://localhost:8484"))
 
-;; Same API as embedded mode
-(def db (db remote-conn))
-(q '[:find ...] db)
-(pull db pattern eid)
-(transact! remote-conn tx-data)
+;; Cluster with automatic failover across leader changes:
+(def conn (connect-remote* '("http://node-0:8484" "http://node-1:8484")))
 
-;; Transparent caching: the peer caches db segments locally
-;; and only fetches deltas from the server.
+;; All basic operations work over HTTP:
+(remote-transact! conn tx-ops)     ;; → tx-report alist
+(remote-q conn query-form)         ;; → result rows
+(remote-pull conn pattern eid)     ;; → entity map
 ```
+
+Note: operations are server-side round-trips.  Local db-value caching
+(Datomic-style) is planned for Phase 6.4.
 
 #### 5.3 Transaction Stream
 
@@ -2179,28 +2184,244 @@ transport so nodes can run in separate OS processes.
 
 #### 6.3 TCP/TLS Transport 🚧 Not started
 
-`(std raft)` uses in-process Scheme channels.  A transport adapter must bridge
-each node's inbox channel to a TCP socket to span processes or machines.
+`(std raft)` communicates over in-process Scheme channels.  A transport adapter
+must bridge each node's inbox channel to a TCP/TLS socket so nodes can run in
+separate OS processes or on separate machines.
 
-```scheme
-;; Future API sketch:
-(def cfg (new-replication-config 'node-0
-           '("node-1:7001" "node-2:7002")  ;; peer addresses
-           "/var/lib/jerboa-db/node-0"
-           :port 7000))
-(def node (replicated-connect "/var/lib/jerboa-db/node-0" cfg))
+##### Architecture
+
+Each `raft-node` has two channel roles:
+- **Inbox**: the node's message loop reads from its own inbox channel.
+- **Peers list**: a list of `(id . channel)` pairs; the node writes outgoing messages to peer channels.
+
+The transport adapter replaces each peer's direct channel with a **proxy channel**:
+
+```
+Node A (process 1)                   Node B (process 2)
+─────────────────────────────────    ─────────────────────────────────
+raft-node-A                          raft-node-B
+  peers: [(B . proxy-ch-B)]            peers: [(A . proxy-ch-A)]
+  inbox: local-ch-A                    inbox: local-ch-B
+         ↕                                    ↕
+  outbound fiber:                      outbound fiber:
+  read proxy-ch-B → serialize          read proxy-ch-A → serialize
+  → write to TCP conn to B →           → write to TCP conn to A →
+         ↕   (TLS optional)                   ↕   (TLS optional)
+  inbound fiber:                       inbound fiber:
+  read TCP conn from B → deserialize   read TCP conn from A → deserialize
+  → channel-put local-ch-A            → channel-put local-ch-B
 ```
 
-The consensus algorithm is complete and correct; only the wire transport is
-absent.  Estimated effort: 2–4 weeks.
+The Raft message loop is unchanged — it still reads/writes Scheme channels.
+Only the plumbing beneath the channels changes.
+
+##### Wire protocol
+
+```
+Frame format (length-prefixed):
+  [4 bytes big-endian uint32: body length][body: FASL-encoded message]
+
+Messages (Raft vector messages, as-is from (std raft)):
+  #(request-vote term candidate-id last-log-index last-log-term)
+  #(vote-response term granted? voter-id)
+  #(append-entries term leader-id prev-idx prev-term entries commit-index)
+  #(append-response term success? follower-id match-index)
+  #(client-propose command reply-channel)   ;; local only, never sent over wire
+```
+
+`client-propose` is always local (client → leader via local channel).
+Only the four Raft RPC message types cross the wire.
+
+##### Implementation plan
+
+```scheme
+;; lib/jerboa-db/transport.ss  (new file)
+
+(import (jerboa prelude)
+        (rename (only (chezscheme) make-time) (make-time chez-make-time))
+        (std net tcp)
+        (std net tls)      ;; optional — TLS wrapping
+        (std misc channel)
+        (jerboa-db replication))
+
+;; --- Outbound proxy fiber ---
+;; Reads from a local channel and writes length-framed FASL to a TCP connection.
+(def (start-outbound-proxy! proxy-ch tcp-conn)
+  (fork-thread
+    (lambda ()
+      (let loop ()
+        (let ([msg (channel-get proxy-ch)])
+          (unless (eof-object? msg)
+            (let* ([bytes (fasl-write-to-bytevector msg)]
+                   [len   (bytevector-length bytes)]
+                   [frame (make-bytevector (+ 4 len))])
+              (bytevector-u32-set! frame 0 len 'big)
+              (bytevector-copy! bytes 0 frame 4 len)
+              (guard (exn [#t (void)])  ;; peer disconnected
+                (tcp-write tcp-conn frame))
+              (loop))))))))
+
+;; --- Inbound listener fiber ---
+;; Reads length-framed FASL from a TCP connection and puts to node inbox.
+(def (start-inbound-listener! tcp-conn local-inbox)
+  (fork-thread
+    (lambda ()
+      (let loop ()
+        (let ([len-buf (tcp-read tcp-conn 4)])
+          (when (and len-buf (= (bytevector-length len-buf) 4))
+            (let* ([len  (bytevector-u32-ref len-buf 0 'big)]
+                   [body (tcp-read tcp-conn len)])
+              (when (and body (= (bytevector-length body) len))
+                (let ([msg (fasl-read-from-bytevector body)])
+                  (channel-put local-inbox msg))
+                (loop)))))))))
+
+;; --- Transport-aware cluster startup ---
+(def (start-transport-cluster node-id peers data-path port . tls-opts)
+  ;; peers: list of (id host port) — other cluster members
+  ;; 1. Make raft-node, wire peer proxy channels
+  ;; 2. Start TCP listener on `port` for inbound connections
+  ;; 3. Dial each peer, start outbound proxy + inbound listener
+  ;; 4. Start Raft
+  ...)
+```
+
+##### Planned API
+
+```scheme
+;; lib/jerboa-db/replication.ss (extension)
+
+;; TCP cluster config — extends new-replication-config
+(def cfg (new-replication-config
+           'node-0
+           '((node-1 "host-b" 7001)   ;; peer descriptors
+             (node-2 "host-c" 7002))
+           "/var/lib/jerboa-db/node-0"
+           :port 7000
+           :tls  #t))   ;; enable TLS
+
+;; Starts Raft + TCP transport:
+(def rconn (replicated-connect "/var/lib/jerboa-db/node-0" cfg))
+
+;; Same cluster API as in-process:
+(cluster-transact! rconn schema-tx)
+(cluster-db rconn)
+(cluster-status rconn)
+```
+
+##### TLS
+
+Optional TLS via `(std net tls)`:
+
+```scheme
+;; Mutual TLS (mTLS) for inter-node auth:
+(def tls-cfg
+  (tls-config-with (default-tls-config)
+    :cert "/etc/jerboa-db/node.crt"
+    :key  "/etc/jerboa-db/node.key"
+    :ca   "/etc/jerboa-db/ca.crt"))
+
+;; Outbound: (tls-connect host port tls-cfg) instead of tcp-connect
+;; Inbound:  (tls-accept tcp-server tls-cfg) instead of tcp-accept
+```
+
+For development clusters on a trusted network, plain TCP is fine.  For
+production or cross-datacenter deployments, mTLS is recommended.
+
+**Estimated effort:** 2–4 weeks.  The consensus algorithm is complete; the
+transport is purely I/O plumbing.
+
+#### 6.4 Peer Client (`peer.ss`) ✅ Functional (HTTP-based)
+
+**File:** `lib/jerboa-db/peer.ss`
+
+The peer library connects to a running `jerboa-db server` over HTTP and
+exposes a remote database API.  It is **fully functional** for basic
+operations.  It does not yet cache immutable db segments locally (every
+operation is a network round-trip).
+
+##### API
+
+```scheme
+(import (jerboa-db peer))
+
+;; Connect to a single server:
+(def conn (connect-remote "http://localhost:8484"))
+
+;; Connect to a cluster with automatic failover
+;; (rotates through URLs on error with exponential backoff):
+(def conn (connect-remote* '("http://node-0:8484"
+                              "http://node-1:8484"
+                              "http://node-2:8484")))
+
+;; Transact — POSTs to /api/transact, returns tx-report alist:
+(remote-transact! conn
+  '({db/ident person/name  db/valueType db.type/string  db/cardinality db.cardinality/one}))
+(remote-transact! conn '({person/name "Alice"  person/age 30}))
+;; => ((tx-id . 536870913) (datom-count . 3) (tempids . ...))
+
+;; Query — POSTs to /api/query, results run server-side:
+(remote-q conn '((find ?n) (where (?e person/name ?n))))
+;; => (("Alice"))
+
+;; Pull — POSTs to /api/pull:
+(remote-pull conn '[*] 12345)
+;; => ((db/id . 12345) (person/name . "Alice") ...)
+
+;; Cluster status (when server has register-cluster! wired):
+;; GET /api/cluster/status → alist of Raft fields
+```
+
+##### Failover behavior
+
+`connect-remote*` accepts multiple server URLs.  On any transport or HTTP
+error, `with-retry` rotates the URL list (failed primary moves to the end)
+and retries with exponential backoff (100 ms, 200 ms, 400 ms, up to 3
+attempts).  This means the client automatically follows a Raft leader change
+within ~700 ms.
+
+```scheme
+;; Under the hood, failover! rotates the URL list:
+;; ["node-0" "node-1" "node-2"]
+;;   → error on node-0
+;; ["node-1" "node-2" "node-0"]   ;; node-1 becomes primary candidate
+```
+
+##### What's missing
+
+| Feature | Status | Notes |
+|---|---|---|
+| Local db-value caching | 🚧 TODO | Every query is a network round-trip; Datomic-style segment caching would let queries run locally |
+| WebSocket tx-stream | 🚧 TODO | `remote-tx-stream` stub raises an error; needs `(std net fiber-ws)` in a fiber context |
+| Named database support | 🚧 TODO | All ops target the server's "default" db; `/api/db/:name/...` routes not yet used |
+| `remote-entity` | 🚧 TODO | Entity API via `GET /api/entity/:eid` |
+| `remote-db` as db-value | 🚧 TODO | Currently returns a stats alist; should return a real `db-value` for passing to local `q`/`pull` |
+
+##### Db-value caching (future)
+
+The server needs a `GET /api/db/snapshot` endpoint that returns the full
+`db-value` serialized as FASL.  The peer downloads it once and holds it
+locally; subsequent `q`/`pull` calls run against the local snapshot.
+The WebSocket tx-stream delivers new tx-data so the peer can apply
+incremental updates without a full re-download.
+
+```scheme
+;; Future: download snapshot once, run queries locally
+(def db (remote-snapshot conn))  ;; FASL download of full db-value
+(q '[(find ?n) (where (?e person/name ?n))] db)  ;; entirely local
+(remote-tx-stream conn (lambda (tx-report)
+  (set! db (apply-tx-report db tx-report))))      ;; incremental update
+```
 
 **Phase 6 success criteria:**
 - ✅ Leader elected within 500ms in 3-node cluster (in-process)
 - ✅ `cluster-transact!` commits and returns tx-report (1-node and 3-node)
 - ✅ Follower connections converge to leader state within 200ms (in-process)
 - ✅ `cluster-status` returns Raft fields + db basis-tx
-- 🚧 Leader failure triggers automatic election (Raft handles this; untested cross-process)
-- 🚧 TCP/TLS transport for multi-process/multi-host clusters
+- ✅ `peer.ss` HTTP client — transact, query, pull with failover (multi-URL)
+- 🚧 TCP/TLS transport for multi-process/multi-host clusters (Phase 6.3)
+- 🚧 WebSocket tx-stream in peer client
+- 🚧 Local db-value caching in peer client (Datomic-style segment cache)
 
 ### Phase 7: Polish and Ecosystem
 
@@ -2446,7 +2667,7 @@ Files: `lib/jerboa-db/server.ss`
 | Cluster status endpoint | ✅ Done | `GET /api/cluster/status` — Raft status or `{mode: standalone}` |
 | WebSocket tx-stream | ✅ Done | `GET /api/tx-stream` — broadcasts tx-reports to all subscribers |
 | `register-cluster!` hook | ✅ Done | Wires cluster status thunk to HTTP endpoint |
-| Remote peer client | ❌ TODO | `peer.ss` not started |
+| Remote peer client | ✅ Done | `peer.ss` — see Phase 6.4 |
 
 ### Distribution (Phase 6) — ✅ IN-PROCESS COMPLETE
 
@@ -2462,8 +2683,10 @@ Files: `lib/jerboa-db/replication.ss`, `lib/jerboa-db/cluster.ss`, `tests/test-c
 | Read consistency levels | ✅ Done | `read-committed`, `read-latest`, `as-of-tx` |
 | Cluster status / introspection | ✅ Done | `cluster-status / cluster-leader?` |
 | Integration test suite | ✅ Done | 6/6 tests passing (`tests/test-cluster.ss`) |
-| TCP/TLS transport | 🚧 TODO | Phase 6.3 — needed for multi-process/multi-host |
-| Remote peer client | ❌ TODO | `peer.ss` not started |
+| TCP/TLS transport | 🚧 TODO | Phase 6.3 — needed for multi-process/multi-host; `(std net tcp)` + `(std net tls)` available |
+| Remote peer client (HTTP) | ✅ Done | `peer.ss` — connect-remote, remote-transact!, remote-q, remote-pull, multi-URL failover |
+| Remote peer — db-value cache | 🚧 TODO | Every op is a network round-trip; Datomic-style local snapshot not yet implemented |
+| Remote peer — WebSocket stream | 🚧 TODO | `remote-tx-stream` stub; needs fiber context wiring |
 
 ### Polish (Phase 7) — ✅ MOSTLY COMPLETE
 
