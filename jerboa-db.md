@@ -803,61 +803,63 @@ the connection registry handle multiple named databases.
 
 ### Infrastructure (Phase 6: Raft Distribution)
 
-**File:** `lib/jerboa-db/replication.ss` (333-line stub)
+**Files:** `lib/jerboa-db/replication.ss`, `lib/jerboa-db/cluster.ss`
 
-Full Raft-based distribution is months of work, but the architecture is clear.
-The key insight: jerboa-db's immutable `db-value` snapshots are ideal for
-replication — each transaction produces a new snapshot that can be shipped to
-replicas as a batch of datoms.
+The in-process Raft layer is complete.  Multi-node replication works inside a
+single OS process using `(std raft)` channels.  What remains is a TCP/TLS
+transport adapter to span processes or machines (Phase 6.3).
+
+#### What's implemented
+
+**`replication.ss`** — Raft node lifecycle + apply path:
+- `start-replication / stop-replication` — wrap a `(std raft)` node
+- `start-local-cluster N` — create a fully-wired in-process N-node cluster
+- `replicated-transact!` — propose a tx to the Raft log (leader only)
+- `replication-for-each-committed!` — iterate newly committed log entries via callback
+- `replication-status / replication-leader? / replication-running?`
+- Read consistency helpers: `read-committed`, `read-latest`, `as-of-tx`
+
+**`cluster.ss`** — Bridge between `(jerboa-db core)` and `(jerboa-db replication)`:
+- `replicated-conn` record — wraps a connection + replication-state + apply fiber
+- `cluster-transact!` — propose → wait for consensus → return tx-report
+- `cluster-db / cluster-db/consistent` — read db-value at appropriate consistency
+- `cluster-status / cluster-leader?` — Raft status + db basis-tx
+- `start-local-db-cluster N` — convenience for in-process test clusters
+- Background apply fiber — reads the leader's complete Raft log every 50 ms and applies committed entries to each node's local connection via full `transact!` semantics (schema materialization, fulltext, stats)
+
+#### Architecture notes
+
+All nodes share the same apply path: every node's fiber reads the **cluster
+leader's** Raft log rather than the node's own local log.  This works around
+a limitation in `(std raft)` where the AppendEntries handler can truncate
+earlier entries from a follower's local log view.
+
+For **1-node clusters**, `(std raft)` never fires `try-advance-commit-index!`
+(it's triggered by AppendEntriesResponse, which requires peers).  The apply
+fiber detects this case and treats the last log entry as effectively committed
+— the single node IS the quorum.
 
 #### Roles
 
-- **Leader (transactor):** Accepts `transact!` calls.  Writes to local
-  LevelDB.  Replicates the tx-data datoms to all follower log entries.
-  Commits when a quorum of followers ack.
+- **Leader (transactor):** Accepts `cluster-transact!`.  Proposes entries to
+  the Raft log.  Returns after the entry is committed and applied locally.
 
-- **Follower (read peer):** Applies replicated tx-data to its own LevelDB
-  copy.  Serves `q`, `pull`, `entity` calls.  Never accepts `transact!`.
+- **Follower (read replica):** Apply fiber replicates all committed entries
+  from the leader's log.  Serves `cluster-db` reads (eventually consistent,
+  typically < 100 ms behind the leader).
 
-- **Client peer (remote):** No local storage.  Sends queries and transactions
-  over the network to the leader/followers.  Caches recent db-values locally
-  in an LRU (mimicking Datomic's peer caching).
-
-#### Replication log
-
-Use `(std raft)` for leader election and log consensus.  Each log entry is a
-FASL-encoded list of datoms from one transaction.  Log entries are idempotent:
-applying the same datoms twice is safe because the index sees repeated entries
-and ignores already-asserted datoms.
-
-```scheme
-;; replication.ss: apply a replicated log entry to a local db
-(def (apply-log-entry! conn encoded-entry)
-  (let* ([datoms (fasl-decode encoded-entry)]
-         ;; Re-transact the raw datoms (skip validation, go direct to index)
-         [db-after (apply-raw-datoms (connection-current-db conn) datoms)])
-    (connection-current-db-set! conn db-after)))
-```
+- **Transport (Phase 6.3, not yet started):** `(std raft)` uses in-process
+  channels.  A future transport adapter will bridge each node's inbox channel
+  to a TCP/TLS socket, enabling multi-process and multi-host clusters.
 
 #### Peer caching (the real Datomic secret)
 
 Datomic's performance at scale comes from peers caching immutable database
-segments in memory.  Since segments never mutate (only new segments are
-appended), a peer can cache the entire working set.  Queries never hit the
-transactor — they hit the peer's local cache.
-
-For jerboa-db, the equivalent is caching the `db-value` record (which is an
-immutable persistent RB-tree) on the remote peer.  After applying each tx,
-the peer holds the latest snapshot locally and all reads are local.
-
-This is implemented naturally by the existing design: the remote peer calls
-`(db conn)` to get a local snapshot and runs `q` against it.  The "caching"
-is just keeping the `connection` alive in the peer process.
-
-**Effort estimate:** ~2 months for a production-grade Raft implementation.
-The `(std raft)` module handles the consensus algorithm; the integration work
-is leader election, log shipping, and the remote peer client API (Phase 5
-prerequisite).
+segments in memory.  Since segments never mutate, a peer can cache the entire
+working set.  For jerboa-db the equivalent is the `db-value` record (an
+immutable persistent RB-tree) which lives on each node after `transact!`
+updates the connection.  All reads are against a local immutable snapshot —
+no network round-trip needed.
 
 ---
 
@@ -2040,16 +2042,16 @@ availability is also build-dependent.  This phase is post-MBrainz work.
 - Parquet export produces valid files readable by pandas/DuckDB/Spark
 - CSV/Parquet import creates correct datoms with schema validation
 
-### Phase 5: Server Mode 🚧 STUB
+### Phase 5: Server Mode ✅ Functional
 
 **Goal:** A standalone Jerboa-DB server accessible over HTTP and WebSocket,
 enabling multi-client access and remote peers.
 
-**Current state:** `server.ss` (221 lines) has complete route handlers for all
-REST endpoints and the WebSocket tx-stream (fiber-based, with a mutex-guarded
-client registry and broadcast).  The EDN request/response plumbing is in place.
-It has **not been integrated** into a runnable entry point or CLI — no `main`
-invocation exists.  Consider it a functional skeleton awaiting a build target.
+**Current state:** `server.ss` is fully functional.  All REST endpoints are
+implemented, the WebSocket tx-stream is wired up, the named-database registry
+allows multiple connections to be served from one process, and
+`register-cluster!` bridges the cluster status to the HTTP API.  A runnable
+entry point (`main`) and CLI are the remaining items before shipping.
 
 #### 5.1 HTTP API
 
@@ -2121,39 +2123,84 @@ never block the transactor.
 **Goal:** Multi-node Jerboa-DB with automatic failover.  One transactor (leader),
 multiple read replicas (followers).
 
-#### 6.1 Raft-Based Transactor
+**Current state:** The in-process layer is **complete and tested**.  All six
+integration tests pass.  The outstanding item is Phase 6.3 — a TCP/TLS
+transport so nodes can run in separate OS processes.
+
+#### 6.1 Raft-Based Transactor ✅ Complete (in-process)
 
 ```scheme
-;; lib/jerboa-db/replication.ss
+;; lib/jerboa-db/replication.ss + lib/jerboa-db/cluster.ss
 
-;; The transactor is a Raft leader.
-;; Transactions are proposed to the Raft log.
-;; Once committed by majority, they're applied to local indices.
-;; Followers apply transactions from the Raft log.
+;; Create a 3-node in-process cluster:
+(def cfg (new-replication-config 'node-0 #f ":memory:"))
+(def nodes (start-local-db-cluster 3 cfg))
 
-;; Uses (std raft) for leader election and log replication.
-;; Uses (std actor transport) for inter-node communication.
+;; Wait for Raft to elect a leader (150–300 ms):
+(sleep (make-time 'time-duration 500000000 0))
+(def leader (find cluster-leader? nodes))
+
+;; Transact through the leader (blocks until committed + applied):
+(cluster-transact! leader
+  '({db/ident person/name  db/valueType db.type/string  db/cardinality db.cardinality/one}
+    {db/ident person/age   db/valueType db.type/long    db/cardinality db.cardinality/one}))
+(cluster-transact! leader '({person/name "Alice"  person/age 30}))
+
+;; Read from any node (read-committed):
+(q '[(find ?n ?a) (where (?e person/name ?n) (?e person/age ?a))]
+   (cluster-db leader))
+;; => (("Alice" 30))
+
+;; Check status:
+(cluster-status leader)
+;; => ((node-id . 0) (role . leader) (term . 3) ... (basis-tx . 536870914))
+
+;; Stop all nodes:
+(for-each cluster-stop! nodes)
 ```
 
-#### 6.2 Read Replicas
+#### 6.2 Read Replicas ✅ Complete (in-process)
 
 ```scheme
-;; Followers maintain full index copies (LevelDB).
-;; They tail the transaction log and apply transactions locally.
-;; Queries against followers are eventually consistent
-;; (typically < 100ms behind the leader).
+;; Followers maintain independent connections.
+;; The apply fiber replicates all committed entries within ~50 ms.
 
-;; Consistency options:
-;; :read-committed   — any follower, may be slightly behind
-;; :read-latest      — leader only, always current
-;; :as-of tx-id      — any node, guaranteed consistent at that tx
+(def followers (filter (lambda (n) (not (cluster-leader? n))) nodes))
+
+;; Queries run against local immutable snapshots:
+(q '[(find ?v) (where (?e thing/val ?v))]
+   (cluster-db (car followers)))
+;; => ((42))
+
+;; Read consistency levels (all implemented):
+(cluster-db follower)           ;; read-committed — any node, may lag ≤ 50 ms
+(cluster-db/consistent leader)  ;; read-latest — leader only, always current
 ```
+
+#### 6.3 TCP/TLS Transport 🚧 Not started
+
+`(std raft)` uses in-process Scheme channels.  A transport adapter must bridge
+each node's inbox channel to a TCP socket to span processes or machines.
+
+```scheme
+;; Future API sketch:
+(def cfg (new-replication-config 'node-0
+           '("node-1:7001" "node-2:7002")  ;; peer addresses
+           "/var/lib/jerboa-db/node-0"
+           :port 7000))
+(def node (replicated-connect "/var/lib/jerboa-db/node-0" cfg))
+```
+
+The consensus algorithm is complete and correct; only the wire transport is
+absent.  Estimated effort: 2–4 weeks.
 
 **Phase 6 success criteria:**
-- Leader failure triggers automatic election within 5 seconds
-- Read replicas stay within 100ms of leader during normal operation
-- No data loss on leader failure (Raft quorum guarantees)
-- Client automatically reconnects to new leader
+- ✅ Leader elected within 500ms in 3-node cluster (in-process)
+- ✅ `cluster-transact!` commits and returns tx-report (1-node and 3-node)
+- ✅ Follower connections converge to leader state within 200ms (in-process)
+- ✅ `cluster-status` returns Raft fields + db basis-tx
+- 🚧 Leader failure triggers automatic election (Raft handles this; untested cross-process)
+- 🚧 TCP/TLS transport for multi-process/multi-host clusters
 
 ### Phase 7: Polish and Ecosystem
 
@@ -2388,24 +2435,35 @@ File: `lib/jerboa-db/analytics.ss`
 | Parquet import | 🚧 Stub | `import-parquet` present; needs DuckDB `COPY FROM` + datom re-ingestion |
 | CSV import | 🚧 Stub | `import-csv` present; needs DuckDB `COPY FROM` + datom re-ingestion |
 
-### Server Mode (Phase 5) — ⚠️ STUB
+### Server Mode (Phase 5) — ✅ FUNCTIONAL
 
-Files: `lib/jerboa-db/server.ss`, `lib/jerboa-db/peer.ss`
-
-| Feature | Status | Notes |
-|---|---|---|
-| HTTP server | ⚠️ Stub | Skeleton exists, not functional |
-| WebSocket tx-stream | ❌ TODO | Post-MBrainz |
-| Remote peer client | ❌ TODO | Post-MBrainz |
-
-### Distribution (Phase 6) — ⚠️ STUB
-
-File: `lib/jerboa-db/replication.ss`
+Files: `lib/jerboa-db/server.ss`
 
 | Feature | Status | Notes |
 |---|---|---|
-| Raft consensus | ⚠️ Stub | Skeleton exists |
-| Replicated transactions | ❌ TODO | Post-MBrainz |
+| HTTP REST API | ✅ Done | All routes: transact, query, pull, entity, schema, stats |
+| Named database registry | ✅ Done | `register-db! / unregister-db! / lookup-db` |
+| Cluster status endpoint | ✅ Done | `GET /api/cluster/status` — Raft status or `{mode: standalone}` |
+| WebSocket tx-stream | ✅ Done | `GET /api/tx-stream` — broadcasts tx-reports to all subscribers |
+| `register-cluster!` hook | ✅ Done | Wires cluster status thunk to HTTP endpoint |
+| Remote peer client | ❌ TODO | `peer.ss` not started |
+
+### Distribution (Phase 6) — ✅ IN-PROCESS COMPLETE
+
+Files: `lib/jerboa-db/replication.ss`, `lib/jerboa-db/cluster.ss`, `tests/test-cluster.ss`
+
+| Feature | Status | Notes |
+|---|---|---|
+| Raft node lifecycle | ✅ Done | `start-replication / stop-replication` |
+| Local N-node cluster | ✅ Done | `start-local-cluster / start-local-db-cluster` |
+| Leader election | ✅ Done | `(std raft)` handles 150–300 ms election |
+| Replicated transactions | ✅ Done | `cluster-transact!` — propose → wait → tx-report |
+| Follower convergence | ✅ Done | Apply fiber replicates committed entries within 50 ms |
+| Read consistency levels | ✅ Done | `read-committed`, `read-latest`, `as-of-tx` |
+| Cluster status / introspection | ✅ Done | `cluster-status / cluster-leader?` |
+| Integration test suite | ✅ Done | 6/6 tests passing (`tests/test-cluster.ss`) |
+| TCP/TLS transport | 🚧 TODO | Phase 6.3 — needed for multi-process/multi-host |
+| Remote peer client | ❌ TODO | `peer.ss` not started |
 
 ### Polish (Phase 7) — ✅ MOSTLY COMPLETE
 

@@ -40,15 +40,22 @@
 
     ;; Status / introspection
     replication-status      replication-leader?
+    replication-running?
 
     ;; Write path (leader only)
     replicated-transact!
 
     ;; Apply path (all nodes)
     replication-apply-committed!
+    replication-for-each-committed!   ;; callback-based variant (conn-aware callers)
+    replication-last-applied-index    ;; expose watermark for polling
 
     ;; Read consistency helpers
-    read-committed          read-latest         as-of-tx)
+    read-committed          read-latest         as-of-tx
+
+    ;; Helpers re-exported for use in (jerboa-db cluster)
+    log-entry-field
+    replication-set-last-applied-index!)
 
   (import (except (chezscheme)
                   make-hash-table hash-table?
@@ -100,7 +107,8 @@
     (fields config                                  ;; replication-config
             raft-node                               ;; (std raft) node object
             cluster                                 ;; raft-cluster (or #f for standalone)
-            (mutable last-applied-index)))          ;; highest Raft log index applied locally
+            (mutable last-applied-index)            ;; highest Raft log index applied locally
+            (mutable running?)))          ;; highest Raft log index applied locally
 
   ;; =========================================================================
   ;; Lifecycle
@@ -118,7 +126,7 @@
     (let* ([node-id (replication-config-node-id config)]
            [node    (make-raft-node node-id)])
       (raft-start! node)
-      (let ([state (make-replication-state config node #f 0)])
+      (let ([state (make-replication-state config node #f 0 #t)])
         (display
           (string-append "Replication started: node "
                          (if (symbol? node-id)
@@ -143,12 +151,13 @@
       (for-each raft-start! nodes)
       (let ([states
              (map (lambda (n)
-                    (make-replication-state base-config n cluster 0))
+                    (make-replication-state base-config n cluster 0 #t))
                   nodes)])
         (values states cluster))))
 
   ;; stop-replication : replication-state -> void
   (def (stop-replication state)
+    (replication-state-running?-set! state #f)
     (raft-stop! (replication-state-raft-node state))
     (void))
 
@@ -174,6 +183,14 @@
   ;; replication-leader? : replication-state -> boolean
   (def (replication-leader? state)
     (raft-leader? (replication-state-raft-node state)))
+
+  ;; replication-running? : replication-state -> boolean
+  ;;
+  ;; Returns #t if this replication state is still active (not stopped).
+  ;; Used by the apply fiber in (jerboa-db cluster) to exit the polling loop.
+  ;; Set to #f by stop-replication.
+  (def (replication-running? state)
+    (replication-state-running? state))
 
   ;; =========================================================================
   ;; Write path — leader only
@@ -287,6 +304,50 @@
       applied-count))
 
   ;; =========================================================================
+  ;; Callback-based apply (conn-aware variant)
+  ;; =========================================================================
+
+  ;; replication-for-each-committed! : replication-state (integer list -> void) -> integer
+  ;;
+  ;; Iterates over newly committed Raft log entries beyond last-applied-index.
+  ;; For each committed tx entry, calls (proc entry-index tx-ops).
+  ;; The caller is responsible for executing the actual transaction — this allows
+  ;; callers (e.g., jerboa-db cluster.ss) to use the full transact! path, which
+  ;; includes schema materialization, fulltext indexing, and stats updates.
+  ;;
+  ;; Non-tx log entries (cluster membership changes, no-ops) are skipped.
+  ;; Returns the number of entries delivered to proc.
+  (def (replication-for-each-committed! state proc)
+    (let* ([node          (replication-state-raft-node state)]
+           [commit-index  (raft-commit-index node)]
+           [last-applied  (replication-state-last-applied-index state)]
+           [delivered 0])
+      (for-each
+        (lambda (entry)
+          (let ([entry-index   (log-entry-field entry 0)]
+                [entry-command (log-entry-field entry 2)])
+            (when (and (integer? entry-index)
+                       (> entry-index last-applied)
+                       (<= entry-index commit-index))
+              ;; Advance watermark before calling proc so a crash mid-apply
+              ;; still moves the watermark forward (at-most-once semantics).
+              (replication-state-last-applied-index-set! state entry-index)
+              (when (and (pair? entry-command)
+                         (eq? (car entry-command) 'tx))
+                (proc entry-index (cdr entry-command))
+                (set! delivered (+ delivered 1))))))
+        (raft-log node))
+      delivered))
+
+  ;; replication-last-applied-index : replication-state -> integer
+  ;;
+  ;; Returns the highest Raft log index that has been applied locally.
+  ;; Useful for polling in cluster-transact! to know when a proposal
+  ;; has been applied (entry-index <= last-applied-index).
+  (def (replication-last-applied-index state)
+    (replication-state-last-applied-index state))
+
+  ;; =========================================================================
   ;; Read consistency levels
   ;; =========================================================================
 
@@ -320,6 +381,13 @@
   ;; =========================================================================
   ;; Internal helpers
   ;; =========================================================================
+
+  ;; replication-set-last-applied-index! : replication-state integer -> void
+  ;;
+  ;; Exported setter so (jerboa-db cluster)'s cluster-aware apply fiber can
+  ;; advance the watermark without importing the internal record accessor.
+  (def (replication-set-last-applied-index! state index)
+    (replication-state-last-applied-index-set! state index))
 
   ;; log-entry-field : record integer -> value
   ;;

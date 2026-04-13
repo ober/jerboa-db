@@ -6,6 +6,7 @@
 ;;;
 ;;; Routes:
 ;;;   GET  /health                       — liveness probe
+;;;   GET  /api/cluster/status           — Raft cluster status (standalone: {mode: standalone})
 ;;;   GET  /api/dbs                      — list registered database names
 ;;;   GET  /api/db/stats                 — stats for the default connection
 ;;;   GET  /api/db/schema                — schema for the default connection
@@ -25,7 +26,8 @@
   (export
     start-server stop-server
     new-server-config server-config?
-    register-db! unregister-db! lookup-db)
+    register-db! unregister-db! lookup-db
+    register-cluster!)
 
   (import (except (chezscheme)
                   make-hash-table hash-table?
@@ -77,6 +79,18 @@
     (with-mutex *registry-mutex*
       (hash-remove! *db-registry* name)))
 
+  ;; ---- Cluster status hook ----
+  ;;
+  ;; Optional thunk registered by the application when running in cluster mode.
+  ;; Called by GET /api/cluster/status.  Returns an alist or #f (standalone).
+  ;; Set by calling (register-cluster! thunk) before or after start-server.
+
+  (def *cluster-status-fn* #f)
+
+  (def (register-cluster! status-fn)
+    "Register a thunk () -> alist that returns cluster status for the HTTP API."
+    (set! *cluster-status-fn* status-fn))
+
   (def (lookup-db name)
     (with-mutex *registry-mutex*
       (hash-get *db-registry* name)))
@@ -127,6 +141,11 @@
 
   (def (handle-health req)
     (respond-text 200 "ok"))
+
+  (def (handle-cluster-status req)
+    (if *cluster-status-fn*
+        (respond-edn 200 (*cluster-status-fn*))
+        (respond-edn 200 '((mode . standalone)))))
 
   (def (handle-list-dbs req)
     (let ([names (list-db-names)])
@@ -267,6 +286,8 @@
       ;; Health + metadata
       (route-get  r "/health"
         (lambda (req) (handle-health req)))
+      (route-get  r "/api/cluster/status"
+        (lambda (req) (handle-cluster-status req)))
       (route-get  r "/api/dbs"
         (lambda (req) (handle-list-dbs req)))
 
