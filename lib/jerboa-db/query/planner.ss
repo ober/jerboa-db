@@ -105,10 +105,14 @@
              ;; V-bound + ref attr: VAET reverse lookup (also fast).
              (if v-bound? (if (and attr (avet-eligible? attr)) 60 50) 0)
              (if a-bound? 20 0))))]  ;; attribute bound (always true for valid queries)
-      ;; Predicate/function clauses: score by how many vars are already bound
+      ;; Predicate/function clauses: if ALL vars are bound, score maximally so
+      ;; the clause fires as an early filter immediately after its last dep.
+      ;; Otherwise score proportionally to bound vars.
       [(and (pair? clause) (pair? (car clause)))
        (let ([used (clause-used-vars clause)])
-         (* 5 (length (filter (lambda (v) (memq v bound-vars)) used))))]
+         (if (for-all (lambda (v) (memq v bound-vars)) used)
+             1000
+             (* 5 (length (filter (lambda (v) (memq v bound-vars)) used)))))]
       [else 0]))
 
   ;; ---- Clause reordering ----

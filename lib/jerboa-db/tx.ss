@@ -66,6 +66,7 @@
            [indices (db-value-indices db)]
            [tx-id (+ (db-value-basis-tx db) 1)]
            [next-eid (car next-eid-cell)]
+           [initial-next-eid (car next-eid-cell)]  ;; snapshot for fresh-entity detection
            [tempid-map '()]
            [produced-datoms '()])
 
@@ -190,7 +191,28 @@
                           d
                           (loop (+ i 1)))))))))  )
 
+      ;; Per-transaction value cache: O(1) lookup for cardinality/one checks.
+      ;; Keyed by a composite fixnum (eid * 256 + aid) — no allocation per lookup.
+      ;; Assumes aid < 256 (generous: schemas typically have < 100 attributes).
+      ;; Updated by every emit-datom! call.
+      ;; This avoids the EAVT index scan for freshly-allocated entities.
+      (define tx-val-cache (make-eqv-hashtable))
+      (define *cache-miss* (list 'miss))  ;; unique sentinel
+
+      (define (tx-cache-key eid aid) (+ (* eid 256) aid))  ;; allocation-free
+
+      ;; Returns a datom if (eid,aid) has a live assertion in this tx, else #f.
+      (define (tx-current-value eid aid)
+        (let ([v (hashtable-ref tx-val-cache (tx-cache-key eid aid) *cache-miss*)])
+          (and (not (eq? v *cache-miss*))
+               (make-datom eid aid v tx-id #t))))
+
       (define (emit-datom! e a v added?)
+        ;; Maintain O(1) lookup cache (pure fixnum key — no allocation)
+        (let ([key (tx-cache-key e a)])
+          (if added?
+              (hashtable-set! tx-val-cache key v)
+              (hashtable-delete! tx-val-cache key)))
         (set! produced-datoms
               (cons (make-datom e a v tx-id added?) produced-datoms)))
 
@@ -238,9 +260,14 @@
                               attr-ident (db-attribute-value-type attr) cval)))
                   ;; Check uniqueness
                   (check-unique-value! attr eid cval)
-                  ;; Cardinality/one: auto-retract old value
+                  ;; Cardinality/one: auto-retract old value.
+                  ;; For freshly-allocated entities (eid >= initial-next-eid) no
+                  ;; index value can exist — skip the expensive EAVT scan and only
+                  ;; check datoms produced earlier in this transaction.
                   (when (cardinality-one? attr)
-                    (let ([old (current-value eid aid)])
+                    (let ([old (or (tx-current-value eid aid)
+                                   (and (< eid initial-next-eid)
+                                        (current-value eid aid)))])
                       (when (and old (not (equal? (datom-v old) cval)))
                         (emit-datom! eid aid (datom-v old) #f))))
                   ;; Handle ref values:
@@ -290,7 +317,9 @@
                               [else cval])])
             (check-unique-value! attr eid final-val)
             (when (cardinality-one? attr)
-              (let ([old (current-value eid aid)])
+              (let ([old (or (tx-current-value eid aid)
+                              (and (< eid initial-next-eid)
+                                   (current-value eid aid)))])
                 (when (and old (not (equal? (datom-v old) final-val)))
                   (emit-datom! eid aid (datom-v old) #f))))
             (emit-datom! eid aid final-val #t))))

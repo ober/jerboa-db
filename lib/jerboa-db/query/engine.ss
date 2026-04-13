@@ -37,8 +37,15 @@
 
   ;; ---- Binding environment ----
   ;; A binding is an eq? hashtable: var-symbol → value.
-  ;; O(1) lookup vs O(n) for alists. Copy-on-extend preserves immutability
-  ;; across the binding-set list used during clause evaluation.
+  ;; O(1) lookup via binding-ref is critical for large-output queries (Q4: 428K rows).
+  ;; Copy-on-extend preserves immutability across the binding-set list used during
+  ;; clause evaluation.
+  ;;
+  ;; Note: we explored alist bindings (O(1) binding-set, O(n_vars) binding-ref)
+  ;; which are faster for small-output aggregation (Q8: 2×), but slower for
+  ;; large-output queries (Q4: 2× slower due to extraction cost). Hashtable wins
+  ;; overall for mixed workloads. Vector-indexed bindings would be ideal (O(1)
+  ;; both ways) but require query-compile-time var-index assignment.
 
   (def (make-empty-bindings) (make-hashtable symbol-hash eq?))
 
@@ -335,6 +342,17 @@
                                           tx-spec op-spec bindings)])
               (loop (cdr ds) (if new-b (cons new-b results) results)))))))
 
+  ;; Resolve bound logic-vars in a predicate form to concrete values.
+  ;; Used so that ((> ?v ?input-var)) pushes down even when ?input-var
+  ;; is a bound logic-variable rather than a literal constant.
+  (def (resolve-pred-form-against bindings pred-form)
+    (map (lambda (x)
+           (if (logic-var? x)
+               (let ([v (binding-ref bindings x)])
+                 (if v v x))
+               x))
+         pred-form))
+
   ;; ---- Main query evaluation ----
 
   (def (evaluate-where-clauses db clauses bindings-list schema rules-ht)
@@ -362,12 +380,23 @@
                                 ;; Entity must be unbound; if bound, EAVT is faster
                                 (logic-var? e-spec)
                                 (not (binding-ref (car bindings-list) e-spec)))
-                           (let* ([b1 (parse-range-predicate (caar rest) v-spec)]
+                           (let* ([;; Resolve bound logic-vars (e.g. input params) so
+                                   ;; ((> ?v ?input)) pushes down even when ?input is a
+                                   ;; bound logic-var rather than a literal constant.
+                                   resolved-pred1
+                                     (if (pair? bindings-list)
+                                         (resolve-pred-form-against (car bindings-list) (caar rest))
+                                         (caar rest))]
+                                  [b1 (parse-range-predicate resolved-pred1 v-spec)]
                                   ;; Absorb a second consecutive range predicate too
                                   [b2 (and b1
                                            (pair? (cdr rest))
                                            (predicate-clause? (cadr rest))
-                                           (parse-range-predicate (caadr rest) v-spec))]
+                                           (let ([resolved-pred2
+                                                   (if (pair? bindings-list)
+                                                       (resolve-pred-form-against (car bindings-list) (caadr rest))
+                                                       (caadr rest))])
+                                             (parse-range-predicate resolved-pred2 v-spec)))]
                                   [bounds (and b1 (merge-range-bounds b1 b2))]
                                   [skip-n (if b2 2 (if b1 1 0))])
                              (if bounds
@@ -466,42 +495,149 @@
   (def (any-aggregates? find-vars)
     (exists (lambda (v) (and (pair? v) (aggregate? (car v)))) find-vars))
 
+  ;; ---- Streaming aggregation helpers ----
+  ;; Accumulators are mutable vectors updated in place — no allocation per row
+  ;; for count/sum/avg/min/max (only 3 group objects for Q8's 655K rows).
+
+  (def (streamable-aggregate? name)
+    (memq name '(count sum avg min max)))
+
+  (def (init-agg-acc name)
+    (case name
+      [(count) (vector 0)]
+      [(sum)   (vector 0)]
+      [(avg)   (vector 0 0)]   ;; #(sum count)
+      [(min)   (vector #f)]
+      [(max)   (vector #f)]))
+
+  (def (update-agg-acc! name acc val)
+    (case name
+      [(count)
+       (vector-set! acc 0 (+ (vector-ref acc 0) 1))]
+      [(sum)
+       (when (number? val)
+         (vector-set! acc 0 (+ (vector-ref acc 0) val)))]
+      [(avg)
+       (when (number? val)
+         (vector-set! acc 0 (+ (vector-ref acc 0) val))
+         (vector-set! acc 1 (+ (vector-ref acc 1) 1)))]
+      [(min)
+       (let ([cur (vector-ref acc 0)])
+         (when (or (not cur)
+                   (and (number? val) (number? cur) (< val cur))
+                   (and (string? val) (string? cur) (string<? val cur)))
+           (vector-set! acc 0 val)))]
+      [(max)
+       (let ([cur (vector-ref acc 0)])
+         (when (or (not cur)
+                   (and (number? val) (number? cur) (> val cur))
+                   (and (string? val) (string? cur) (string>? val cur)))
+           (vector-set! acc 0 val)))]))
+
+  (def (finalize-agg-acc name acc)
+    (case name
+      [(avg)
+       (let ([cnt (vector-ref acc 1)])
+         (if (= cnt 0) 0
+             (inexact (/ (vector-ref acc 0) cnt))))]
+      [else (vector-ref acc 0)]))
+
+  (def (streaming-aggregate find-vars grouping-vars agg-specs bindings-list)
+    ;; Single-pass aggregation: accum-ht maps group-key → outer-vector.
+    ;; outer-vector[i] = inner accumulator for agg-specs[i] (mutable, updated in place).
+    ;; For Q8: 655K rows, 3 groups → allocates exactly 3 outer-vectors + 3*2 inner-vectors.
+    ;;
+    ;; Pre-compute a flat dispatch table so extraction avoids mutation-based indexing:
+    ;; find-spec-slots: vector of (symbol . info) where info is either
+    ;;   ('agg agg-name agg-index) or ('grp grp-index)
+    (let* ([accum-ht (make-hashtable equal-hash equal?)]
+           [n-aggs (length agg-specs)]
+           ;; Build slot table for extraction — explicit left-to-right loop avoids
+           ;; depending on map's evaluation order (Chez applies lambda right-to-left).
+           [slots (let loop ([fvs find-vars] [ai 0] [gi 0] [acc '()])
+                    (if (null? fvs)
+                        (reverse acc)
+                        (let ([fv (car fvs)])
+                          (cond
+                            [(and (pair? fv) (aggregate? (car fv)))
+                             (loop (cdr fvs) (+ ai 1) gi
+                                   (cons (list 'agg (car fv) ai) acc))]
+                            [(logic-var? fv)
+                             (loop (cdr fvs) ai (+ gi 1)
+                                   (cons (list 'grp gi) acc))]
+                            [else
+                             (loop (cdr fvs) ai gi
+                                   (cons (list 'lit fv) acc))]))))])
+      (for-each
+        (lambda (bindings)
+          (let* ([key (map (lambda (v) (binding-ref bindings v)) grouping-vars)]
+                 [outer (hashtable-ref accum-ht key #f)])
+            (if outer
+                ;; Hot path: update existing accumulators in place
+                (let loop ([specs agg-specs] [i 0])
+                  (unless (null? specs)
+                    (update-agg-acc! (caar specs) (vector-ref outer i)
+                                     (binding-ref bindings (cadar specs)))
+                    (loop (cdr specs) (+ i 1))))
+                ;; Cold path: first row for this group key
+                (let ([outer (make-vector n-aggs)])
+                  (let loop ([specs agg-specs] [i 0])
+                    (unless (null? specs)
+                      (let ([acc (init-agg-acc (caar specs))])
+                        (update-agg-acc! (caar specs) acc
+                                         (binding-ref bindings (cadar specs)))
+                        (vector-set! outer i acc))
+                      (loop (cdr specs) (+ i 1))))
+                  (hashtable-set! accum-ht key outer)))))
+        bindings-list)
+      ;; Extract final results — one row per group using pre-computed slots
+      (let-values ([(keys outers) (hashtable-entries accum-ht)])
+        (map (lambda (group-key outer)
+               (map (lambda (slot)
+                      (case (car slot)
+                        [(agg) (finalize-agg-acc (cadr slot)
+                                                  (vector-ref outer (caddr slot)))]
+                        [(grp) (list-ref group-key (cadr slot))]
+                        [(lit) (cadr slot)]))
+                    slots))
+             (vector->list keys)
+             (vector->list outers)))))
+
   (def (apply-aggregates find-vars bindings-list)
     ;; Fast path: single (count ?x) with no grouping vars — just count rows.
-    ;; Skips group-bindings hashtable construction and per-row value extraction.
     (if (and (= 1 (length find-vars))
              (pair? (car find-vars))
              (eq? 'count (caar find-vars))
              (logic-var? (cadar find-vars)))
         (list (list (length bindings-list)))
-        ;; General path: group non-aggregate vars, then aggregate within each group.
+        ;; Dispatch: streaming path for count/sum/avg/min/max (no allocation per row);
+        ;; fallback materializes all bindings for count-distinct/distinct/median/etc.
         (let* ([grouping-vars (filter (lambda (v) (not (and (pair? v) (aggregate? (car v)))))
                                       find-vars)]
-           [agg-specs (filter (lambda (v) (and (pair? v) (aggregate? (car v))))
-                              find-vars)]
-           ;; Group bindings by grouping vars
-           [groups (group-bindings grouping-vars bindings-list)])
-      ;; For each group, compute aggregates
-      (map (lambda (group)
-             (let ([sample-binding (car (cdr group))]
-                   [group-bindings (cdr group)])
-               (map (lambda (fv)
-                      (if (and (pair? fv) (aggregate? (car fv)))
-                          ;; Aggregate: collect values and apply
-                          (let* ([agg-name (car fv)]
-                                 [agg-var (cadr fv)]
-                                 [values (map (lambda (b) (binding-ref b agg-var))
-                                              group-bindings)])
-                            (aggregate-apply agg-name values))
-                          ;; Non-aggregate: extract from sample
-                          (if (logic-var? fv)
-                              (binding-ref sample-binding fv)
-                              fv)))
-                    find-vars)))
-           groups))))
+               [agg-specs (filter (lambda (v) (and (pair? v) (aggregate? (car v))))
+                                  find-vars)])
+          (if (for-all (lambda (spec) (streamable-aggregate? (car spec))) agg-specs)
+              (streaming-aggregate find-vars grouping-vars agg-specs bindings-list)
+              ;; Fallback: materialize per-group binding lists
+              (let ([groups (group-bindings grouping-vars bindings-list)])
+                (map (lambda (group)
+                       (let ([sample-binding (car (cdr group))]
+                             [group-bindings (cdr group)])
+                         (map (lambda (fv)
+                                (if (and (pair? fv) (aggregate? (car fv)))
+                                    (let* ([agg-name (car fv)]
+                                           [agg-var (cadr fv)]
+                                           [values (map (lambda (b) (binding-ref b agg-var))
+                                                        group-bindings)])
+                                      (aggregate-apply agg-name values))
+                                    (if (logic-var? fv)
+                                        (binding-ref sample-binding fv)
+                                        fv)))
+                              find-vars)))
+                     groups))))))
 
   (def (group-bindings grouping-vars bindings-list)
-    ;; Group bindings by the values of grouping-vars.
+    ;; Fallback: group bindings by grouping-vars values.
     ;; Returns: list of (group-key . bindings-list)
     (let ([ht (make-hashtable equal-hash equal?)])
       (for-each

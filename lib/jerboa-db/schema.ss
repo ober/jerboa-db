@@ -218,10 +218,12 @@
         (db-attribute-unique attr)))
 
   ;; avet-eligible?: should this attribute be stored in the AVET index?
-  ;; True for all scalar (non-ref, non-tuple) attributes.
+  ;; Only indexed or unique scalar attributes — matches Datomic AVET semantics.
+  ;; Non-indexed scalars fall back to AEVT scan (still correct, just slower).
   ;; Ref types use VAET for reverse lookups; tuple/any values are not AVET-indexable.
   (def (avet-eligible? attr)
     (and attr
+         (indexed-attr? attr)
          (not (memq (db-attribute-value-type attr)
                     '(db.type/ref db.type/tuple db.type/any)))))
 
