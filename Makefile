@@ -7,7 +7,7 @@ CHEZ_EXT_DIR ?= $(HOME)/src
 CHEZ_EXT_LIBDIRS = $(CHEZ_EXT_DIR)/chez-lmdb:$(CHEZ_EXT_DIR)/chez-duckdb
 FULL_LIBDIRS = $(LIBDIRS):$(CHEZ_EXT_LIBDIRS)
 
-.PHONY: test build clean check bench bench-quick
+.PHONY: test build clean check bench bench-quick mbrainz mbrainz-quick
 
 # Run the core test suite (in-memory, no FFI deps)
 test:
@@ -39,6 +39,14 @@ bench:
 # Quick load test (1/10 scale — runs in under 5s)
 bench-quick:
 	$(SCHEME) --libdirs "$(LIBDIRS)" --script benchmarks/load-test.ss --quick
+
+# MBrainz benchmark (8 standard queries, synthetic data at full scale)
+mbrainz:
+	$(SCHEME) --libdirs "$(LIBDIRS)" --script benchmarks/mbrainz-bench.ss
+
+# MBrainz quick smoke test (1% scale, ~3 runs per query)
+mbrainz-quick:
+	$(SCHEME) --libdirs "$(LIBDIRS)" --script benchmarks/mbrainz-bench.ss --quick
 
 # Clean compiled artifacts
 clean:
