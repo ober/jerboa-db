@@ -28,7 +28,7 @@ synthetic data at configurable scale.  `make mbrainz-quick` for smoke test,
 | 1 | Core in-memory (datoms, indices, schema, Datalog, pull, time-travel) | ✅ Complete |
 | 2 | LevelDB persistence (`connect("path")`, 4-index LevelDB backend, FASL encoding) | ✅ Complete |
 | 3 | Query engine (planner, predicates, aggregates, rules, streaming) | ✅ Complete |
-| 4 | DuckDB analytics (SQL over datoms, Parquet export/import) | 🚧 Stub |
+| 4 | DuckDB analytics (SQL over datoms, Parquet export/import) | ✅ Core done, Parquet 🚧 |
 | 5 | Server mode (HTTP API, WebSocket tx-stream, remote peer) | 🚧 Stub |
 | 6 | Raft HA (distributed consensus, read replicas) | 📋 Planned |
 | 7 | Polish (backup/restore ✅, GDPR excision ✅, schema migration 🚧) | ✅ Mostly done |
@@ -93,9 +93,9 @@ they are unimplemented (❌), implemented (✅), or planned stubs (🚧).
 | `pull` | ✅ Done | Full pattern walking with nesting, limits, defaults |
 | `pull-many` | ✅ Done | Exported from `core.ss` |
 | `entity` / `touch` | ✅ Done | Lazy entity maps with eager materialization |
-| `datoms` (direct index iteration) | ❌ Missing | Datomic's `(d/datoms db index components...)` not exposed publicly |
-| `index-range` | ❌ Missing | Datomic's `(d/index-range db :attr ...)` not exposed |
-| `seek-datoms` | ❌ Missing | Positioned scan into an index, not exposed |
+| `datoms` (direct index iteration) | ✅ Done | `(datoms db 'eavt eid)`, `(datoms db 'avet attr val)` — resolves ident symbols, applies time-travel filters |
+| `index-range` | ❌ Missing | Datomic's `(d/index-range db :attr start end)` — see Roadmap below |
+| `seek-datoms` | ❌ Missing | Positioned scan — see Roadmap below |
 
 ### Distribution
 
@@ -113,9 +113,9 @@ they are unimplemented (❌), implemented (✅), or planned stubs (🚧).
 | Feature | Status | Notes |
 |---|---|---|
 | Datalog aggregation (count/sum/avg/min/max) | ✅ Done | Built-in, streaming |
-| DuckDB SQL over datoms | 🚧 Stub | `analytics.ss` has full structure; not wired to core |
-| Parquet export/import | ❌ Missing | Depends on DuckDB integration |
-| CSV bulk import | ❌ Missing | Depends on DuckDB integration |
+| DuckDB SQL over datoms | ✅ Done | `analytics-export! db`, `analytics-query ae sql` — lazy-loaded, tables: `datoms` + `attrs` |
+| Parquet export/import | 🚧 Stub | `export-parquet`/`import-parquet` stubs in `analytics.ss` — DuckDB COPY TO wiring needed |
+| CSV bulk import | 🚧 Stub | `import-csv` stub in `analytics.ss` — DuckDB COPY FROM wiring needed |
 
 ---
 
@@ -1967,19 +1967,21 @@ aggregation, rules, built-in functions, and streaming results.
 - Built-in functions work in filter and binding positions
 - Query over 1M datoms completes in < 1 second for typical OLTP patterns
 
-### Phase 4: DuckDB Analytics Layer 🚧 STUB
+### Phase 4: DuckDB Analytics Layer ✅ CORE DONE
 
 **Goal:** Wire DuckDB as an analytical query engine for workloads that don't
 fit Datalog — aggregation over large datasets, window functions, ad-hoc SQL.
 
-**Current state:** `analytics.ss` (249 lines) imports `(std db duckdb)` and has:
-- `new-analytics-engine` — creates a DuckDB connection and the `datoms` table
-- `analytics-sync!` — reads the tx-log and inserts datom rows into DuckDB
-- `analytics-query` — executes SQL against the replica
-- `insert-datom-row!` with type-classified column slots
+**Current state:** `analytics.ss` fully rewritten and wired into `core.ss`:
+- `new-analytics-engine schema` — creates an in-memory or file-backed DuckDB instance and the `datoms` + `attrs` tables
+- `analytics-sync! ae db-val` — full EAVT scan → DuckDB bulk insert (delete + re-insert on each sync)
+- `analytics-query ae sql` — executes SQL, returns list of alists with string column names
+- `analytics-export! db-val` — convenience one-liner: create engine + sync
+- `analytics-close! ae` — closes DuckDB handle
+- All exported from `(jerboa-db core)` via lazy-load (`ensure-analytics!`)
+- Parquet and CSV stubs present but not wired to DuckDB COPY TO/FROM
 
-The structure is complete but has **not been wired into `core.ss`** (no auto-sync on
-`transact!`, no user-facing `analytics` function exported from core).  DuckDB FFI
+DuckDB FFI
 availability is also build-dependent.  This phase is post-MBrainz work.
 
 #### 4.1 DuckDB Replica
@@ -2373,16 +2375,18 @@ Files: `lib/jerboa-db/query/engine.ss`, `lib/jerboa-db/query/planner.ss`,
 | Pull API | ✅ Done | Nesting, wildcards, reverse refs, limits, defaults, cycle detection |
 | Query explain | ✅ Done | Returns plan without executing |
 
-### Analytics (Phase 4) — ⚠️ STUB
+### Analytics (Phase 4) — ✅ CORE DONE
 
 File: `lib/jerboa-db/analytics.ss`
 
 | Feature | Status | Notes |
 |---|---|---|
-| DuckDB replica | ⚠️ Stub | Code exists, not wired to DuckDB FFI yet |
-| SQL query interface | ❌ TODO | Needs DuckDB FFI integration |
-| Parquet export/import | ❌ TODO | Post-MBrainz |
-| CSV import | ❌ TODO | Post-MBrainz |
+| DuckDB datom export | ✅ Done | `analytics-export! db-val` — full EAVT scan into `datoms` + `attrs` tables |
+| SQL query interface | ✅ Done | `analytics-query ae sql` — returns list of alists |
+| Lazy loading | ✅ Done | `ensure-analytics!` in `core.ss` — DuckDB not required for normal operation |
+| Parquet export | 🚧 Stub | `export-parquet` present; needs DuckDB `COPY TO` wiring |
+| Parquet import | 🚧 Stub | `import-parquet` present; needs DuckDB `COPY FROM` + datom re-ingestion |
+| CSV import | 🚧 Stub | `import-csv` present; needs DuckDB `COPY FROM` + datom re-ingestion |
 
 ### Server Mode (Phase 5) — ⚠️ STUB
 
