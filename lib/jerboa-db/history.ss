@@ -20,24 +20,33 @@
     db-datoms-eavt db-datoms-aevt db-datoms-avet db-datoms-vaet
     db-resolve-index db-filter-datom?)
 
-  (import (chezscheme)
+  (import (except (chezscheme)
+                  make-hash-table hash-table?
+                  sort sort!
+                  printf fprintf
+                  path-extension path-absolute?
+                  with-input-from-string with-output-to-string
+                  iota 1+ 1-
+                  partition
+                  make-date make-time)
+          (jerboa prelude)
           (jerboa-db datom)
           (jerboa-db index protocol))
 
   ;; ---- Database value (immutable snapshot) ----
 
-  (define-record-type db-value
-    (fields basis-tx    ;; integer: the latest tx included in this snapshot
-            indices     ;; index-set (EAVT/AEVT/AVET/VAET)
-            schema      ;; schema-registry at this point in time
-            as-of-tx    ;; #f for current, or tx-id for time-travel
-            since-tx    ;; #f for current, or tx-id for since filter
-            history?))  ;; #t to include retracted datoms
+  (defstruct db-value
+    (basis-tx    ;; integer: the latest tx included in this snapshot
+     indices     ;; index-set (EAVT/AEVT/AVET/VAET)
+     schema      ;; schema-registry at this point in time
+     as-of-tx    ;; #f for current, or tx-id for time-travel
+     since-tx    ;; #f for current, or tx-id for since filter
+     history?))  ;; #t to include retracted datoms
 
   ;; ---- Time-travel constructors ----
 
   ;; Return db as it was at transaction tx-id (datoms with tx <= tx-id)
-  (define (as-of db tx-id)
+  (def (as-of db tx-id)
     (make-db-value
       (db-value-basis-tx db)
       (db-value-indices db)
@@ -47,7 +56,7 @@
       (db-value-history? db)))
 
   ;; Return db showing only datoms added after tx-id
-  (define (since db tx-id)
+  (def (since db tx-id)
     (make-db-value
       (db-value-basis-tx db)
       (db-value-indices db)
@@ -57,7 +66,7 @@
       (db-value-history? db)))
 
   ;; Return db showing all datoms including retracted ones
-  (define (history db)
+  (def (history db)
     (make-db-value
       (db-value-basis-tx db)
       (db-value-indices db)
@@ -74,7 +83,7 @@
   ;; whose latest datom is an assertion) is handled by consumers
   ;; (query engine, pull, entity) since they need to see both assertions
   ;; and retractions to determine which values are current.
-  (define (db-filter-datom? db d)
+  (def (db-filter-datom? db d)
     (let ([tx (datom-tx d)]
           [as-of (db-value-as-of-tx db)]
           [since-tx (db-value-since-tx db)])
@@ -86,7 +95,7 @@
 
   ;; ---- Index access with filtering ----
 
-  (define (db-resolve-index db index-name)
+  (def (db-resolve-index db index-name)
     (let ([idxs (db-value-indices db)])
       (case index-name
         [(eavt) (index-set-eavt idxs)]
@@ -95,21 +104,21 @@
         [(vaet) (index-set-vaet idxs)]
         [else (error 'db-resolve-index "unknown index" index-name)])))
 
-  (define (filtered-datoms db index-name start end)
+  (def (filtered-datoms db index-name start end)
     (let ([idx (db-resolve-index db index-name)])
       (filter (lambda (d) (db-filter-datom? db d))
               (dbi-range idx start end))))
 
-  (define (db-datoms-eavt db e-start e-end)
+  (def (db-datoms-eavt db e-start e-end)
     (filtered-datoms db 'eavt e-start e-end))
 
-  (define (db-datoms-aevt db a-start a-end)
+  (def (db-datoms-aevt db a-start a-end)
     (filtered-datoms db 'aevt a-start a-end))
 
-  (define (db-datoms-avet db a-start a-end)
+  (def (db-datoms-avet db a-start a-end)
     (filtered-datoms db 'avet a-start a-end))
 
-  (define (db-datoms-vaet db v-start v-end)
+  (def (db-datoms-vaet db v-start v-end)
     (filtered-datoms db 'vaet v-start v-end))
 
 ) ;; end library

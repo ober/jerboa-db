@@ -51,7 +51,16 @@
     connection-next-eid connection-next-eid-set!
     connection-fulltext-index)
 
-  (import (chezscheme)
+  (import (except (chezscheme)
+                  make-hash-table hash-table?
+                  sort sort!
+                  printf fprintf
+                  path-extension path-absolute?
+                  with-input-from-string with-output-to-string
+                  iota 1+ 1-
+                  partition
+                  make-date make-time)
+          (jerboa prelude)
           (jerboa-db datom)
           (jerboa-db schema)
           (jerboa-db index protocol)
@@ -71,14 +80,14 @@
   ;; A connection holds the mutable state: current db-value, entity counter,
   ;; transaction log, and cache.
 
-  (define-record-type connection
-    (fields (mutable current-db)      ;; db-value
-            (mutable next-eid)        ;; next entity ID to assign (mutable cell)
-            (mutable tx-log)          ;; list of tx-reports (most recent first)
-            (mutable db-cache)        ;; LRU cache
-            path                      ;; storage path (":memory:" for in-memory)
-            (mutable db-handles)      ;; LevelDB handles for cleanup (#f for in-memory)
-            (mutable fulltext-index))) ;; in-memory fulltext inverted index
+  (defstruct connection
+    (current-db      ;; db-value
+     next-eid        ;; next entity ID to assign (mutable cell)
+     tx-log          ;; list of tx-reports (most recent first)
+     db-cache        ;; LRU cache
+     path            ;; storage path (":memory:" for in-memory)
+     db-handles      ;; LevelDB handles for cleanup (#f for in-memory)
+     fulltext-index)) ;; in-memory fulltext inverted index
 
   ;; ---- connect ----
   ;; path = ":memory:" → in-memory RB-tree indices
@@ -86,11 +95,11 @@
 
   ;; Lazy loader for LevelDB backend — avoids loading the shared library
   ;; until a persistent connection is actually requested.
-  (define leveldb-loaded? #f)
-  (define leveldb-make-index-set #f)
-  (define leveldb-close-index-set #f)
+  (def leveldb-loaded? #f)
+  (def leveldb-make-index-set #f)
+  (def leveldb-close-index-set #f)
 
-  (define (ensure-leveldb!)
+  (def (ensure-leveldb!)
     (unless leveldb-loaded?
       (eval '(import (jerboa-db index leveldb)))
       (set! leveldb-make-index-set
@@ -99,7 +108,7 @@
             (eval 'close-leveldb-index-set))
       (set! leveldb-loaded? #t)))
 
-  (define (connect path)
+  (def (connect path)
     (let-values ([(indices handles)
                   (if (string=? path ":memory:")
                       (values (make-mem-index-set) #f)
@@ -121,7 +130,7 @@
   ;; ---- close ----
   ;; Close a persistent connection. No-op for in-memory.
 
-  (define (close conn)
+  (def (close conn)
     (let ([handles (connection-db-handles conn)])
       (when handles
         (when leveldb-close-index-set
@@ -130,12 +139,12 @@
 
   ;; ---- db: get current database value ----
 
-  (define (db conn)
+  (def (db conn)
     (connection-current-db conn))
 
   ;; ---- transact! ----
 
-  (define (transact! conn tx-ops)
+  (def (transact! conn tx-ops)
     (let* ([current (connection-current-db conn)]
            [eid-cell (connection-next-eid conn)]
            [report (process-transaction current tx-ops eid-cell)])
@@ -156,7 +165,7 @@
   ;; ---- Schema materialization ----
   ;; When datoms define schema attributes, materialize them into the registry.
 
-  (define (materialize-schema-datoms! schema datoms)
+  (def (materialize-schema-datoms! schema datoms)
     ;; Collect datoms that define schema attributes (those with db/ident)
     ;; Group by entity, then build db-attribute records.
     (let ([ident-datoms (filter (lambda (d)
@@ -201,23 +210,23 @@
 
   ;; ---- q: Datalog query ----
 
-  (define (q query-form db-val . inputs)
+  (def (q query-form db-val . inputs)
     (let ([parsed (parse-query query-form)])
       (apply query-db parsed db-val inputs)))
 
   ;; ---- pull ----
 
-  (define (pull db-val pattern eid)
+  (def (pull db-val pattern eid)
     (pull-entity db-val pattern eid))
 
   ;; pull-many re-exported from (jerboa-db query pull)
 
   ;; ---- entity ----
 
-  (define (entity db-val eid)
+  (def (entity db-val eid)
     (new-entity-map eid db-val))
 
-  (define (touch ent)
+  (def (touch ent)
     (entity-touch ent))
 
   ;; ---- Time-travel (re-exported) ----
@@ -225,7 +234,7 @@
 
   ;; ---- Transaction log access ----
 
-  (define (tx-range conn start-tx end-tx)
+  (def (tx-range conn start-tx end-tx)
     ;; Return datoms from the transaction log between start-tx and end-tx
     (let loop ([log (connection-tx-log conn)] [result '()])
       (if (null? log)
@@ -240,7 +249,7 @@
 
   ;; ---- Utilities ----
 
-  (define (db-stats conn)
+  (def (db-stats conn)
     (let* ([current (db conn)]
            [indices (db-value-indices current)])
       `((basis-tx . ,(db-value-basis-tx current))
@@ -250,13 +259,13 @@
         (vaet-count . ,(length (dbi-datoms (index-set-vaet indices))))
         (cache . ,(cache-stats (connection-db-cache conn))))))
 
-  (define (schema-for conn)
+  (def (schema-for conn)
     (schema-all-attributes (db-value-schema (db conn))))
 
   ;; ---- Fulltext search ----
   ;; Search for text in fulltext-indexed attributes on this connection.
 
-  (define (fulltext-search conn attr-ident text)
+  (def (fulltext-search conn attr-ident text)
     (ft-search (connection-fulltext-index conn)
                (db-value-schema (db conn))
                attr-ident
@@ -264,10 +273,10 @@
 
   ;; ---- Garbage collection ----
 
-  (define (gc-collect! conn . opts)
+  (def (gc-collect! conn . opts)
     (apply gc-collect-db! (connection-current-db conn) opts))
 
-  (define (gc-stats conn . opts)
+  (def (gc-stats conn . opts)
     (apply gc-stats-db (connection-current-db conn) opts))
 
 ) ;; end library

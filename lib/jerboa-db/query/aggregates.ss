@@ -9,20 +9,29 @@
     aggregate? aggregate-apply
     register-aggregate!)
 
-  (import (chezscheme))
+  (import (except (chezscheme)
+                  make-hash-table hash-table?
+                  sort sort!
+                  printf fprintf
+                  path-extension path-absolute?
+                  with-input-from-string with-output-to-string
+                  iota 1+ 1-
+                  partition
+                  make-date make-time)
+          (jerboa prelude))
 
   ;; ---- Aggregate registry ----
 
-  (define aggregate-registry (make-eq-hashtable))
+  (def aggregate-registry (make-eq-hashtable))
 
-  (define (register-aggregate! name proc)
+  (def (register-aggregate! name proc)
     ;; proc: (list-of-values) -> result
     (hashtable-set! aggregate-registry name proc))
 
-  (define (aggregate? name)
+  (def (aggregate? name)
     (hashtable-contains? aggregate-registry name))
 
-  (define (aggregate-apply name values)
+  (def (aggregate-apply name values)
     (let ([proc (hashtable-ref aggregate-registry name #f)])
       (unless proc (error 'aggregate-apply "Unknown aggregate" name))
       (proc values)))

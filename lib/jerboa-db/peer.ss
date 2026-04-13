@@ -14,7 +14,16 @@
     remote-db remote-transact! remote-q remote-pull
     remote-tx-stream)
 
-  (import (chezscheme)
+  (import (except (chezscheme)
+                  make-hash-table hash-table?
+                  sort sort!
+                  printf fprintf
+                  path-extension path-absolute?
+                  with-input-from-string with-output-to-string
+                  iota 1+ 1-
+                  partition
+                  make-date make-time)
+          (jerboa prelude)
           (std net request)
           (std net fiber-ws)
           (std text edn)
@@ -24,24 +33,24 @@
 
   ;; ---- Remote connection ----
 
-  (define-record-type remote-connection
-    (fields (mutable urls)        ;; list of URLs, first is current primary
-            (mutable last-tx)     ;; last known transaction ID
-            (mutable retry-count))) ;; consecutive failures on current primary
+  (defstruct remote-connection
+    (urls          ;; list of URLs, first is current primary
+     last-tx       ;; last known transaction ID
+     retry-count)) ;; consecutive failures on current primary
 
-  (define (make-single-remote-connection url)
+  (def (make-single-remote-connection url)
     (make-remote-connection (list url) 0 0))
 
   ;; ---- URL management ----
 
-  (define (current-url conn)
+  (def (current-url conn)
     (car (remote-connection-urls conn)))
 
-  (define (build-url conn path)
+  (def (build-url conn path)
     (string-append (current-url conn) path))
 
   ;; Rotate: move failed primary to end, try next URL
-  (define (failover! conn)
+  (def (failover! conn)
     (let ([urls (remote-connection-urls conn)])
       (when (> (length urls) 1)
         (remote-connection-urls-set! conn (append (cdr urls) (list (car urls))))
@@ -49,7 +58,7 @@
 
   ;; ---- HTTP helpers ----
 
-  (define (check-response! who resp url)
+  (def (check-response! who resp url)
     (let ([status (request-status resp)])
       (unless (and (>= status 200) (< status 300))
         (error who
@@ -59,7 +68,7 @@
   ;; Execute a thunk with retry+failover on transient errors.
   ;; Retries up to max-retries times with exponential backoff (100ms, 200ms, 400ms).
 
-  (define (with-retry conn thunk max-retries)
+  (def (with-retry conn thunk max-retries)
     (let loop ([attempt 0])
       (guard (exn
               [#t
@@ -78,7 +87,7 @@
         (thunk))))
 
   ;; POST with EDN body; returns parsed EDN from response body.
-  (define (post-edn conn path body-obj)
+  (def (post-edn conn path body-obj)
     (with-retry conn
       (lambda ()
         (let* ([url  (build-url conn path)]
@@ -92,7 +101,7 @@
       3))
 
   ;; GET; returns parsed EDN from response body.
-  (define (get-edn conn path)
+  (def (get-edn conn path)
     (with-retry conn
       (lambda ()
         (let* ([url  (build-url conn path)]
@@ -104,7 +113,7 @@
   ;; ---- connect-remote ----
   ;; Single URL. Verifies connectivity via GET /health.
 
-  (define (connect-remote url)
+  (def (connect-remote url)
     (let ([conn (make-single-remote-connection url)])
       (verify-connectivity! conn)
       conn))
@@ -112,7 +121,7 @@
   ;; ---- connect-remote* ----
   ;; Multiple URLs for automatic failover.
 
-  (define (connect-remote* urls)
+  (def (connect-remote* urls)
     (unless (pair? urls)
       (error 'connect-remote* "At least one URL required"))
     (let ([conn (make-remote-connection urls 0 0)])
@@ -127,7 +136,7 @@
               (verify-connectivity! conn))))
       conn))
 
-  (define (verify-connectivity! conn)
+  (def (verify-connectivity! conn)
     (let* ([health-url (string-append (current-url conn) "/health")]
            [resp (guard (exn [#t #f])
                    (http-get health-url))])
@@ -140,7 +149,7 @@
 
   ;; ---- remote-db ----
 
-  (define (remote-db conn)
+  (def (remote-db conn)
     (let ([stats (get-edn conn "/api/db/stats")])
       (when (pair? stats)
         (let ([e (assq 'basis-tx stats)])
@@ -149,7 +158,7 @@
 
   ;; ---- remote-transact! ----
 
-  (define (remote-transact! conn tx-ops)
+  (def (remote-transact! conn tx-ops)
     (let ([result (post-edn conn "/api/transact" tx-ops)])
       (when (pair? result)
         (let ([e (assq 'tx-id result)])
@@ -158,17 +167,17 @@
 
   ;; ---- remote-q ----
 
-  (define (remote-q conn query-form)
+  (def (remote-q conn query-form)
     (post-edn conn "/api/query" query-form))
 
   ;; ---- remote-pull ----
 
-  (define (remote-pull conn pattern eid)
+  (def (remote-pull conn pattern eid)
     (post-edn conn "/api/pull" (list pattern eid)))
 
   ;; ---- remote-tx-stream ----
 
-  (define (remote-tx-stream conn handler)
+  (def (remote-tx-stream conn handler)
     (error 'remote-tx-stream
       "WebSocket tx-stream requires fiber context; use (std fiber) to spawn"))
 

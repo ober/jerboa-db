@@ -9,7 +9,16 @@
     start-server stop-server
     new-server-config server-config?)
 
-  (import (chezscheme)
+  (import (except (chezscheme)
+                  make-hash-table hash-table?
+                  sort sort!
+                  printf fprintf
+                  path-extension path-absolute?
+                  with-input-from-string with-output-to-string
+                  iota 1+ 1-
+                  partition
+                  make-date make-time)
+          (jerboa prelude)
           (std net fiber-httpd)
           (std net fiber-ws)
           (std text edn)
@@ -20,12 +29,12 @@
 
   ;; ---- Server configuration ----
 
-  (define-record-type server-config
-    (fields port       ;; integer (default 8484)
-            host       ;; string (default "0.0.0.0")
-            conn))     ;; jerboa-db connection
+  (defstruct server-config
+    (port   ;; integer (default 8484)
+     host   ;; string (default "0.0.0.0")
+     conn)) ;; jerboa-db connection
 
-  (define (new-server-config conn . opts)
+  (def (new-server-config conn . opts)
     (let ([port (if (and (pair? opts) (number? (car opts))) (car opts) 8484)]
           [host (if (and (pair? opts) (pair? (cdr opts)) (string? (cadr opts)))
                     (cadr opts)
@@ -36,18 +45,18 @@
   ;; A list of connected fiber-ws clients for the tx-stream endpoint.
   ;; Protected by a mutex so multiple fibers can mutate it safely.
 
-  (define ws-clients '())
-  (define ws-mutex (make-mutex))
+  (def ws-clients '())
+  (def ws-mutex (make-mutex))
 
-  (define (ws-add-client! ws)
+  (def (ws-add-client! ws)
     (with-mutex ws-mutex
       (set! ws-clients (cons ws ws-clients))))
 
-  (define (ws-remove-client! ws)
+  (def (ws-remove-client! ws)
     (with-mutex ws-mutex
       (set! ws-clients (filter (lambda (c) (not (eq? c ws))) ws-clients))))
 
-  (define (ws-broadcast! msg)
+  (def (ws-broadcast! msg)
     (let ([snapshot
            (with-mutex ws-mutex (list-copy ws-clients))])
       (for-each
@@ -59,18 +68,18 @@
 
   ;; ---- EDN helpers ----
 
-  (define (respond-edn status obj)
+  (def (respond-edn status obj)
     (respond status
       '(("Content-Type" . "application/edn"))
       (edn->string obj)))
 
-  (define (parse-edn-body req)
+  (def (parse-edn-body req)
     (let ([body (request-body req)])
       (if (and body (string? body) (> (string-length body) 0))
           (string->edn body)
           #f)))
 
-  (define (error->edn-string exn)
+  (def (error->edn-string exn)
     (edn->string
       `(error ,(if (message-condition? exn)
                    (condition-message exn)
@@ -78,13 +87,13 @@
 
   ;; ---- Route handlers ----
 
-  (define (handle-health req)
+  (def (handle-health req)
     (respond-text 200 "ok"))
 
-  (define (handle-db-stats conn req)
+  (def (handle-db-stats conn req)
     (respond-edn 200 (db-stats conn)))
 
-  (define (handle-db-schema conn req)
+  (def (handle-db-schema conn req)
     (let ([attrs (schema-for conn)])
       (respond-edn 200
         (map (lambda (attr)
@@ -93,7 +102,7 @@
                      (db-attribute-cardinality attr)))
              attrs))))
 
-  (define (handle-transact conn req)
+  (def (handle-transact conn req)
     (guard (exn [#t (respond-edn 400 (list 'error
                                       (if (message-condition? exn)
                                           (condition-message exn)
@@ -111,7 +120,7 @@
             (ws-broadcast! (edn->string tx-data))
             (respond-edn 200 tx-data))))))
 
-  (define (handle-query conn req)
+  (def (handle-query conn req)
     (guard (exn [#t (respond-edn 400 (list 'error
                                       (if (message-condition? exn)
                                           (condition-message exn)
@@ -122,7 +131,7 @@
         (let ([results (q form (db conn))])
           (respond-edn 200 results)))))
 
-  (define (handle-pull conn req)
+  (def (handle-pull conn req)
     (guard (exn [#t (respond-edn 400 (list 'error
                                       (if (message-condition? exn)
                                           (condition-message exn)
@@ -135,7 +144,7 @@
                [result (pull (db conn) pattern eid)])
           (respond-edn 200 result)))))
 
-  (define (handle-entity conn eid-str req)
+  (def (handle-entity conn eid-str req)
     (guard (exn [#t (respond-edn 400 (list 'error
                                       (if (message-condition? exn)
                                           (condition-message exn)
@@ -150,7 +159,7 @@
   ;; Registered as the handler for make-websocket-response.
   ;; The fiber loops reading from the client (to detect disconnect),
   ;; while ws-broadcast! pushes transaction events to all clients.
-  (define (handle-tx-stream-ws fd poller req)
+  (def (handle-tx-stream-ws fd poller req)
     (let ([ws (fiber-ws-upgrade (request-headers req) fd poller)])
       (when ws
         (ws-add-client! ws)
@@ -169,7 +178,7 @@
 
   ;; ---- Router construction ----
 
-  (define (build-router conn)
+  (def (build-router conn)
     (let ([r (make-router)])
       (route-get  r "/health"
         (lambda (req) (handle-health req)))
@@ -196,7 +205,7 @@
 
   ;; ---- Server lifecycle ----
 
-  (define (start-server config)
+  (def (start-server config)
     (let* ([conn   (server-config-conn config)]
            [port   (server-config-port config)]
            [router (build-router conn)]
@@ -204,7 +213,7 @@
            [srv   (fiber-httpd-start port handler)])
       (list 'server config srv)))
 
-  (define (stop-server handle)
+  (def (stop-server handle)
     (let ([srv (caddr handle)])
       (fiber-httpd-stop! srv)))
 

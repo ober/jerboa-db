@@ -9,7 +9,16 @@
     new-entity-map entity-map? entity-map-eid
     entity-get entity-touch entity-keys)
 
-  (import (chezscheme)
+  (import (except (chezscheme)
+                  make-hash-table hash-table?
+                  sort sort!
+                  printf fprintf
+                  path-extension path-absolute?
+                  with-input-from-string with-output-to-string
+                  iota 1+ 1-
+                  partition
+                  make-date make-time)
+          (jerboa prelude)
           (jerboa-db datom)
           (jerboa-db schema)
           (jerboa-db index protocol)
@@ -19,18 +28,18 @@
   ;; Lazy: attributes are fetched from the index on first access.
   ;; The cache stores materialized attribute values.
 
-  (define-record-type entity-map
-    (fields eid            ;; integer
-            db             ;; db-value (for index access)
-            (mutable cache)   ;; hashtable: attr-ident -> value(s)
-            (mutable touched?))) ;; #t if all attributes loaded
+  (defstruct entity-map
+    (eid            ;; integer
+     db             ;; db-value (for index access)
+     cache          ;; hashtable: attr-ident -> value(s)
+     touched?))     ;; #t if all attributes loaded
 
-  (define (new-entity-map eid db)
+  (def (new-entity-map eid db)
     (make-entity-map eid db (make-eq-hashtable) #f))
 
   ;; ---- Attribute access ----
 
-  (define (entity-get ent attr-ident)
+  (def (entity-get ent attr-ident)
     (let ([cache (entity-map-cache ent)])
       (if (hashtable-contains? cache attr-ident)
           (hashtable-ref cache attr-ident #f)
@@ -78,7 +87,7 @@
 
   ;; ---- Touch: eagerly load all attributes ----
 
-  (define (entity-touch ent)
+  (def (entity-touch ent)
     (when (not (entity-map-touched? ent))
       (let* ([db (entity-map-db ent)]
              [schema (db-value-schema db)]
@@ -123,7 +132,7 @@
 
   ;; ---- Get all attribute keys ----
 
-  (define (entity-keys ent)
+  (def (entity-keys ent)
     (entity-touch ent)  ;; ensure loaded
     (let-values ([(keys vals) (hashtable-entries (entity-map-cache ent))])
       (vector->list keys)))

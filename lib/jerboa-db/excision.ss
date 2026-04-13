@@ -14,7 +14,16 @@
     excise-entity!
     excise-attribute!)
 
-  (import (chezscheme)
+  (import (except (chezscheme)
+                  make-hash-table hash-table?
+                  sort sort!
+                  printf fprintf
+                  path-extension path-absolute?
+                  with-input-from-string with-output-to-string
+                  iota 1+ 1-
+                  partition
+                  make-date make-time)
+          (jerboa prelude)
           (jerboa-db datom)
           (jerboa-db schema)
           (jerboa-db index protocol)
@@ -23,7 +32,7 @@
 
   ;; ---- Internal: remove datom from all four indices ----
 
-  (define (remove-from-all-indices! indices datom)
+  (def (remove-from-all-indices! indices datom)
     (dbi-remove! (index-set-eavt indices) datom)
     (dbi-remove! (index-set-aevt indices) datom)
     ;; AVET and VAET only contain datoms for indexed/ref attributes,
@@ -33,7 +42,7 @@
 
   ;; ---- Internal: find all datoms matching a predicate in EAVT ----
 
-  (define (scan-eavt-matching indices pred)
+  (def (scan-eavt-matching indices pred)
     ;; Scan all datoms in EAVT and collect those matching pred.
     ;; Returns a list of datoms (both assertions and retractions).
     (filter pred (dbi-datoms (index-set-eavt indices))))
@@ -46,7 +55,7 @@
   ;;
   ;; All matching datoms are physically removed from ALL indices.
 
-  (define (excise! conn excision-spec)
+  (def (excise! conn excision-spec)
     (let* ([current-db (db conn)]
            [indices    (db-value-indices current-db)]
            [schema     (db-value-schema current-db)]
@@ -80,13 +89,13 @@
   ;; ---- excise-entity! ----
   ;; Remove all datoms for eid from all indices.
 
-  (define (excise-entity! conn eid)
+  (def (excise-entity! conn eid)
     (excise! conn `((entity . ,eid))))
 
   ;; ---- excise-attribute! ----
   ;; Remove all datoms for (eid, attr-ident) from all indices.
 
-  (define (excise-attribute! conn eid attr-ident)
+  (def (excise-attribute! conn eid attr-ident)
     (excise! conn `((entity . ,eid) (attribute . ,attr-ident))))
 
 ) ;; end library

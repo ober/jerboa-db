@@ -14,7 +14,16 @@
 (library (jerboa-db gc)
   (export gc-collect-db! gc-stats-db)
 
-  (import (chezscheme)
+  (import (except (chezscheme)
+                  make-hash-table hash-table?
+                  sort sort!
+                  printf fprintf
+                  path-extension path-absolute?
+                  with-input-from-string with-output-to-string
+                  iota 1+ 1-
+                  partition
+                  make-date make-time)
+          (jerboa prelude)
           (jerboa-db datom)
           (jerboa-db schema)
           (jerboa-db index protocol)
@@ -25,7 +34,7 @@
   ;; For each group where highest-tx is a retraction and attribute is noHistory
   ;; (or collect-all? #t), removes all datoms in the group from all indices.
 
-  (define (gc-collect-db! db-val . opts)
+  (def (gc-collect-db! db-val . opts)
     (let* ([collect-all? (and (pair? opts) (car opts))]
            [schema   (db-value-schema db-val)]
            [indices  (db-value-indices db-val)]
@@ -80,7 +89,7 @@
   ;; ---- gc-stats-db ----
   ;; Count reclaimable datoms without removing them.
 
-  (define (gc-stats-db db-val . opts)
+  (def (gc-stats-db db-val . opts)
     (let* ([collect-all? (and (pair? opts) (car opts))]
            [schema  (db-value-schema db-val)]
            [indices (db-value-indices db-val)]

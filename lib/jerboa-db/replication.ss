@@ -50,7 +50,16 @@
     ;; Read consistency helpers
     read-committed          read-latest         as-of-tx)
 
-  (import (chezscheme)
+  (import (except (chezscheme)
+                  make-hash-table hash-table?
+                  sort sort!
+                  printf fprintf
+                  path-extension path-absolute?
+                  with-input-from-string with-output-to-string
+                  iota 1+ 1-
+                  partition
+                  make-date make-time)
+          (jerboa prelude)
           (std raft)
           (jerboa-db tx)
           (jerboa-db history))
@@ -59,19 +68,19 @@
   ;; Configuration
   ;; =========================================================================
 
-  (define-record-type replication-config
-    (fields node-id               ;; unique node identifier (symbol or integer)
-            cluster-nodes         ;; list of peer raft-node objects (in-process),
-                                  ;; or #f for a standalone single-node deployment
-            data-path             ;; local data directory (informational / future use)
-            election-timeout-ms   ;; Raft election timeout hint (ms) — informational;
-                                  ;; (std raft) manages its own 150–300 ms timeout
-            heartbeat-interval-ms ;; Raft heartbeat interval hint (ms) — informational;
-                                  ;; (std raft) uses a 50 ms heartbeat internally
-            read-consistency))    ;; default: 'read-committed | 'read-latest | 'as-of
+  (defstruct replication-config
+    (node-id               ;; unique node identifier (symbol or integer)
+     cluster-nodes         ;; list of peer raft-node objects (in-process),
+                           ;; or #f for a standalone single-node deployment
+     data-path             ;; local data directory (informational / future use)
+     election-timeout-ms   ;; Raft election timeout hint (ms) — informational;
+                           ;; (std raft) manages its own 150–300 ms timeout
+     heartbeat-interval-ms ;; Raft heartbeat interval hint (ms) — informational;
+                           ;; (std raft) uses a 50 ms heartbeat internally
+     read-consistency))    ;; default: 'read-committed | 'read-latest | 'as-of
 
   ;; Convenience constructor: required args + optional tail for timeout / consistency.
-  (define (new-replication-config node-id cluster-nodes data-path . opts)
+  (def (new-replication-config node-id cluster-nodes data-path . opts)
     (make-replication-config
       node-id
       cluster-nodes
@@ -86,11 +95,11 @@
   ;; Replication state
   ;; =========================================================================
 
-  (define-record-type replication-state
-    (fields config                          ;; replication-config
-            raft-node                       ;; (std raft) node object
-            (mutable cluster)               ;; raft-cluster (or #f for standalone)
-            (mutable last-applied-index)))  ;; highest Raft log index applied locally
+  (defstruct replication-state
+    (config                          ;; replication-config
+     raft-node                       ;; (std raft) node object
+     cluster                         ;; raft-cluster (or #f for standalone)
+     last-applied-index))            ;; highest Raft log index applied locally
 
   ;; =========================================================================
   ;; Lifecycle
@@ -104,7 +113,7 @@
   ;;   - Multi-node: caller should use start-local-cluster for a fully wired
   ;;     in-process cluster.  Passing a list of peer raft-node objects as
   ;;     cluster-nodes is reserved for future use.
-  (define (start-replication config)
+  (def (start-replication config)
     (let* ([node-id (replication-config-node-id config)]
            [node    (make-raft-node node-id)])
       (raft-start! node)
@@ -126,7 +135,7 @@
   ;;
   ;; All nodes share the same base-config; each gets the cluster's actual
   ;; raft-node as its raft-node field.
-  (define (start-local-cluster node-count base-config)
+  (def (start-local-cluster node-count base-config)
     (let* ([cluster (make-raft-cluster node-count)]
            [nodes   (raft-cluster-nodes cluster)])
       ;; Start all Raft nodes
@@ -138,7 +147,7 @@
         (values states cluster))))
 
   ;; stop-replication : replication-state -> void
-  (define (stop-replication state)
+  (def (stop-replication state)
     (raft-stop! (replication-state-raft-node state))
     (void))
 
@@ -151,7 +160,7 @@
   ;; Returns a snapshot of the node's current Raft state:
   ;;   node-id, role (follower/candidate/leader), term, commit-index,
   ;;   last-applied-index, leader? flag.
-  (define (replication-status state)
+  (def (replication-status state)
     (let* ([node   (replication-state-raft-node state)]
            [config (replication-state-config state)])
       `((node-id            . ,(replication-config-node-id config))
@@ -162,7 +171,7 @@
         (leader?            . ,(raft-leader? node)))))
 
   ;; replication-leader? : replication-state -> boolean
-  (define (replication-leader? state)
+  (def (replication-leader? state)
     (raft-leader? (replication-state-raft-node state)))
 
   ;; =========================================================================
@@ -186,7 +195,7 @@
   ;;
   ;; Returns: (values 'ok log-index) on acceptance,
   ;;          raises error on non-leader or Raft rejection.
-  (define (replicated-transact! state tx-ops)
+  (def (replicated-transact! state tx-ops)
     (unless (replication-leader? state)
       (error 'replicated-transact!
              "not leader: only the Raft leader may accept write transactions"
@@ -229,7 +238,7 @@
   ;; "best-effort follower" semantics.
   ;;
   ;; Returns the count of transactions successfully applied.
-  (define (replication-apply-committed! state get-db get-eid set-db!)
+  (def (replication-apply-committed! state get-db get-eid set-db!)
     (let* ([node          (replication-state-raft-node state)]
            [commit-index  (raft-commit-index node)]
            [last-applied  (replication-state-last-applied-index state)]
@@ -284,7 +293,7 @@
   ;;
   ;; Returns the local db-value as-is.  Safe on any node; may lag the leader
   ;; by at most one replication round-trip (~50 ms heartbeat interval).
-  (define (read-committed state get-db)
+  (def (read-committed state get-db)
     (get-db))
 
   ;; read-latest : replication-state (-> db-value) -> db-value
@@ -292,7 +301,7 @@
   ;; Returns the local db-value, but only if this node is currently the leader.
   ;; The leader's local DB is always up-to-date with committed transactions.
   ;; Raises an error if called on a follower or candidate.
-  (define (read-latest state get-db)
+  (def (read-latest state get-db)
     (unless (replication-leader? state)
       (error 'read-latest
              "read-latest requires this node to be the Raft leader"
@@ -304,7 +313,7 @@
   ;; Returns a time-travel view of the database as it was at the given
   ;; transaction basis (tx-id).  Valid on any node (the local indices contain
   ;; all historical datoms).  Uses (jerboa-db history) as-of semantics.
-  (define (as-of-tx state get-db basis-tx)
+  (def (as-of-tx state get-db basis-tx)
     (as-of (get-db) basis-tx))
 
   ;; =========================================================================
@@ -316,7 +325,7 @@
   ;; Access the nth field of a (std raft) log-entry record by position.
   ;; Fields are: 0=index, 1=term, 2=command (per define-record-type order).
   ;; This avoids importing internal log-entry-* accessors from (std raft).
-  (define (log-entry-field entry n)
+  (def (log-entry-field entry n)
     (guard (exn [#t #f])
       ((record-accessor (record-rtd entry) n) entry)))
 

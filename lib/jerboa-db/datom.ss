@@ -19,38 +19,47 @@
     ;; Datom utilities
     datom->list datom-matches?)
 
-  (import (chezscheme))
+  (import (except (chezscheme)
+                  make-hash-table hash-table?
+                  sort sort!
+                  printf fprintf
+                  path-extension path-absolute?
+                  with-input-from-string with-output-to-string
+                  iota 1+ 1-
+                  partition
+                  make-date make-time)
+          (jerboa prelude))
 
   ;; ---- Sentinel values for range boundaries ----
   ;; Used to construct probe datoms for index range scans.
   ;; +min-val+ compares less than any real value.
   ;; +max-val+ compares greater than any real value.
 
-  (define-record-type sentinel (fields kind))
-  (define +min-val+ (make-sentinel 'min))
-  (define +max-val+ (make-sentinel 'max))
+  (defstruct sentinel (kind))
+  (def +min-val+ (make-sentinel 'min))
+  (def +max-val+ (make-sentinel 'max))
 
-  (define (sentinel-min? x) (and (sentinel? x) (eq? (sentinel-kind x) 'min)))
-  (define (sentinel-max? x) (and (sentinel? x) (eq? (sentinel-kind x) 'max)))
+  (def (sentinel-min? x) (and (sentinel? x) (eq? (sentinel-kind x) 'min)))
+  (def (sentinel-max? x) (and (sentinel? x) (eq? (sentinel-kind x) 'max)))
 
   ;; ---- Datom record ----
 
-  (define-record-type datom
-    (fields e       ;; entity id (integer)
-            a       ;; attribute id (integer, interned from keyword)
-            v       ;; value (scheme value — type depends on attribute schema)
-            tx      ;; transaction id (integer, monotonically increasing)
-            added?  ;; #t = assertion, #f = retraction
-            ))
+  (defstruct datom
+    (e       ;; entity id (integer)
+     a       ;; attribute id (integer, interned from keyword)
+     v       ;; value (scheme value — type depends on attribute schema)
+     tx      ;; transaction id (integer, monotonically increasing)
+     added?  ;; #t = assertion, #f = retraction
+     ))
 
   ;; ---- Three-way comparison helpers ----
 
-  (define (compare-int a b)
+  (def (compare-int a b)
     (cond [(< a b) -1] [(> a b) 1] [else 0]))
 
   ;; Generic value comparison. Handles sentinels, then dispatches on type.
   ;; Values of different types are ordered by type tag to ensure total ordering.
-  (define (compare-values a b)
+  (def (compare-values a b)
     (cond
       ;; Sentinels
       [(sentinel? a)
@@ -87,7 +96,7 @@
          (compare-int ta tb))]))
 
   ;; Assign a numeric tag to each value type for total cross-type ordering
-  (define (type-tag v)
+  (def (type-tag v)
     (cond
       [(boolean? v)    0]
       [(fixnum? v)     1]
@@ -114,7 +123,7 @@
 
   ;; EAVT: Entity -> Attribute -> Value -> Tx
   ;; "All attributes of entity 42"
-  (define (compare-datoms-eavt a b)
+  (def (compare-datoms-eavt a b)
     (cascade-compare
       (compare-int (datom-e a) (datom-e b))
       (compare-int (datom-a a) (datom-a b))
@@ -123,7 +132,7 @@
 
   ;; AEVT: Attribute -> Entity -> Value -> Tx
   ;; "All entities with :person/name"
-  (define (compare-datoms-aevt a b)
+  (def (compare-datoms-aevt a b)
     (cascade-compare
       (compare-int (datom-a a) (datom-a b))
       (compare-int (datom-e a) (datom-e b))
@@ -132,7 +141,7 @@
 
   ;; AVET: Attribute -> Value -> Entity -> Tx
   ;; "Entity where :email = 'a@b.com'" (unique lookup)
-  (define (compare-datoms-avet a b)
+  (def (compare-datoms-avet a b)
     (cascade-compare
       (compare-int (datom-a a) (datom-a b))
       (compare-values (datom-v a) (datom-v b))
@@ -141,7 +150,7 @@
 
   ;; VAET: Value -> Attribute -> Entity -> Tx
   ;; "All entities referencing entity 42" (reverse refs)
-  (define (compare-datoms-vaet a b)
+  (def (compare-datoms-vaet a b)
     (cascade-compare
       (compare-values (datom-v a) (datom-v b))
       (compare-int (datom-a a) (datom-a b))
@@ -150,11 +159,11 @@
 
   ;; ---- Datom utilities ----
 
-  (define (datom->list d)
+  (def (datom->list d)
     (list (datom-e d) (datom-a d) (datom-v d) (datom-tx d) (datom-added? d)))
 
   ;; Check if a datom matches given components (use #f for "any")
-  (define (datom-matches? d e a v tx)
+  (def (datom-matches? d e a v tx)
     (and (or (not e) (= (datom-e d) e))
          (or (not a) (= (datom-a d) a))
          (or (not v) (equal? (datom-v d) v))

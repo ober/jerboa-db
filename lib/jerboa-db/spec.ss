@@ -12,7 +12,16 @@
 (library (jerboa-db spec)
   (export define-spec validate-entity check-entity-spec)
 
-  (import (chezscheme)
+  (import (except (chezscheme)
+                  make-hash-table hash-table?
+                  sort sort!
+                  printf fprintf
+                  path-extension path-absolute?
+                  with-input-from-string with-output-to-string
+                  iota 1+ 1-
+                  partition
+                  make-date make-time)
+          (jerboa prelude)
           (jerboa-db datom)
           (jerboa-db schema)
           (jerboa-db index protocol)
@@ -22,7 +31,7 @@
   ;; Convenience: transact a spec entity using the connection.
   ;; Returns a tx-op list suitable for passing to transact!
 
-  (define (define-spec spec-ident required-attrs)
+  (def (define-spec spec-ident required-attrs)
     ;; Returns a tx-op (entity map alist) ready for transact!
     (list (cons 'spec/ident spec-ident)
           (cons 'spec/attrs required-attrs)))
@@ -31,7 +40,7 @@
   ;; Find the spec entity with spec/ident = spec-ident.
   ;; Returns a list of required attribute ident symbols, or #f if not found.
 
-  (define (find-spec-attrs db-val spec-ident)
+  (def (find-spec-attrs db-val spec-ident)
     (let* ([schema  (db-value-schema db-val)]
            [indices (db-value-indices db-val)]
            [avet    (index-set-avet indices)]
@@ -64,7 +73,7 @@
   ;; ---- Entity value check ----
   ;; Check if entity eid has a current value for attr-ident.
 
-  (define (entity-has-attr? db-val eid attr-ident)
+  (def (entity-has-attr? db-val eid attr-ident)
     (let* ([schema  (db-value-schema db-val)]
            [indices (db-value-indices db-val)]
            [attr (schema-lookup-by-ident schema attr-ident)])
@@ -82,7 +91,7 @@
   ;; Checks that eid has all required attributes from spec.
   ;; Returns #t on success, raises error on failure.
 
-  (define (validate-entity db-val eid spec-ident)
+  (def (validate-entity db-val eid spec-ident)
     (let ([required (find-spec-attrs db-val spec-ident)])
       (unless required
         (error 'validate-entity "Spec not found" spec-ident))
@@ -98,7 +107,7 @@
   ;; ---- check-entity-spec ----
   ;; Returns (ok . eid) on success or (err . missing-attr-list) on failure.
 
-  (define (check-entity-spec db-val eid spec-ident)
+  (def (check-entity-spec db-val eid spec-ident)
     (let ([required (find-spec-attrs db-val spec-ident)])
       (if (not required)
           (cons 'err (list 'spec-not-found spec-ident))
@@ -112,7 +121,7 @@
   ;; ---- Helpers ----
 
   ;; Get entity IDs from assertion datoms (current state)
-  (define (resolve-current-eids datoms)
+  (def (resolve-current-eids datoms)
     (let ([ht (make-hashtable equal-hash equal?)])
       (for-each
         (lambda (d)
@@ -126,7 +135,7 @@
           (lambda (d) (and (datom-added? d) (datom-e d)))
           (vector->list vals)))))
 
-  (define (resolve-current-datoms datoms)
+  (def (resolve-current-datoms datoms)
     (let ([ht (make-hashtable equal-hash equal?)])
       (for-each
         (lambda (d)
@@ -138,11 +147,10 @@
       (let-values ([(keys vals) (hashtable-entries ht)])
         (filter datom-added? (vector->list vals)))))
 
-  (define (filter-map f lst)
+  (def (filter-map f lst)
     (let loop ([lst lst] [acc '()])
       (if (null? lst) (reverse acc)
           (let ([r (f (car lst))])
             (loop (cdr lst) (if r (cons r acc) acc))))))
-
 
 ) ;; end library

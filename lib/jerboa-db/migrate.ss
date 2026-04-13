@@ -14,7 +14,16 @@
     ;; Online reindexing
     reindex! reindex-attribute!)
 
-  (import (chezscheme)
+  (import (except (chezscheme)
+                  make-hash-table hash-table?
+                  sort sort!
+                  printf fprintf
+                  path-extension path-absolute?
+                  with-input-from-string with-output-to-string
+                  iota 1+ 1-
+                  partition
+                  make-date make-time)
+          (jerboa prelude)
           (jerboa-db datom)
           (jerboa-db schema)
           (jerboa-db index protocol)
@@ -24,35 +33,35 @@
 
   ;; ---- Migration operation types ----
 
-  (define-record-type migration
-    (fields operations))  ;; list of migration ops
+  (defstruct migration
+    (operations))  ;; list of migration ops
 
-  (define-record-type rename-op
-    (fields from-attr to-attr))
+  (defstruct rename-op
+    (from-attr to-attr))
 
-  (define-record-type add-index-op
-    (fields attr-ident))
+  (defstruct add-index-op
+    (attr-ident))
 
-  (define-record-type remove-index-op
-    (fields attr-ident))
+  (defstruct remove-index-op
+    (attr-ident))
 
-  (define-record-type merge-op
-    (fields from-attr into-attr merge-fn))
+  (defstruct merge-op
+    (from-attr into-attr merge-fn))
 
-  (define-record-type split-op
-    (fields from-attr into-a into-b split-fn))
+  (defstruct split-op
+    (from-attr into-a into-b split-fn))
 
   ;; ---- Convenience constructors ----
 
-  (define (make-rename-attr from to) (make-rename-op from to))
-  (define (make-add-index attr) (make-add-index-op attr))
-  (define (make-remove-index attr) (make-remove-index-op attr))
-  (define (make-merge-attr from into fn) (make-merge-op from into fn))
-  (define (make-split-attr from a b fn) (make-split-op from a b fn))
+  (def (make-rename-attr from to) (make-rename-op from to))
+  (def (make-add-index attr) (make-add-index-op attr))
+  (def (make-remove-index attr) (make-remove-index-op attr))
+  (def (make-merge-attr from into fn) (make-merge-op from into fn))
+  (def (make-split-attr from a b fn) (make-split-op from a b fn))
 
   ;; ---- Execute migration ----
 
-  (define (migrate! conn migration-obj)
+  (def (migrate! conn migration-obj)
     (let ([ops (migration-operations migration-obj)]
           [current-db (db conn)]
           [schema (db-value-schema (db conn))])
@@ -79,7 +88,7 @@
 
   ;; ---- Individual migration operations ----
 
-  (define (migrate-rename! conn schema from-ident to-ident)
+  (def (migrate-rename! conn schema from-ident to-ident)
     ;; 1. Create new attribute with same schema as old
     ;; 2. Copy all datoms from old attr to new attr
     ;; 3. Retract all datoms on old attr
@@ -108,7 +117,7 @@
                      `(db/retract ,(car row) ,from-ident ,(cadr row)))
                    results)))))))
 
-  (define (migrate-add-index! conn schema attr-ident)
+  (def (migrate-add-index! conn schema attr-ident)
     ;; Update the schema attribute to set :db/index true
     (let ([attr (schema-lookup-by-ident schema attr-ident)])
       (unless attr (error 'migrate-add-index! "Attribute not found" attr-ident))
@@ -119,7 +128,7 @@
                 (db/cardinality . ,(db-attribute-cardinality attr))
                 (db/index . #t))))))
 
-  (define (migrate-remove-index! conn schema attr-ident)
+  (def (migrate-remove-index! conn schema attr-ident)
     (let ([attr (schema-lookup-by-ident schema attr-ident)])
       (unless attr (error 'migrate-remove-index! "Attribute not found" attr-ident))
       (transact! conn
@@ -128,7 +137,7 @@
                 (db/cardinality . ,(db-attribute-cardinality attr))
                 (db/index . #f))))))
 
-  (define (migrate-merge! conn schema from-ident into-ident merge-fn)
+  (def (migrate-merge! conn schema from-ident into-ident merge-fn)
     ;; Merge values from one attribute into another using merge-fn
     (let ([results (q `((find ?e ?v1 ?v2)
                         (where (?e ,from-ident ?v1)
@@ -142,7 +151,7 @@
                      (,into-ident . ,merged))))
                results)))))
 
-  (define (migrate-split! conn schema from-ident into-a into-b split-fn)
+  (def (migrate-split! conn schema from-ident into-a into-b split-fn)
     ;; Split one attribute into two using split-fn (returns (values a b))
     (let ([results (q `((find ?e ?v) (where (?e ,from-ident ?v)))
                       (db conn))])
@@ -157,7 +166,7 @@
 
   ;; ---- Planning and dry-run ----
 
-  (define (migration-plan migration-obj)
+  (def (migration-plan migration-obj)
     ;; Return a human-readable plan of what the migration will do
     (map (lambda (op)
            (cond
@@ -175,7 +184,7 @@
              [else "UNKNOWN"]))
          (migration-operations migration-obj)))
 
-  (define (migration-dry-run conn migration-obj)
+  (def (migration-dry-run conn migration-obj)
     ;; Report what would change without executing
     (let ([plan (migration-plan migration-obj)])
       (display "Migration plan:\n")
@@ -189,7 +198,7 @@
   ;; EAVT is the source of truth; the other three indices are derived.
   ;; This is useful after manual data manipulation or to compact indices.
 
-  (define (reindex! conn)
+  (def (reindex! conn)
     (let* ([current-db (db conn)]
            [indices    (db-value-indices current-db)]
            [schema     (db-value-schema current-db)]
@@ -227,7 +236,7 @@
   ;; reindex-attribute! rebuilds AVET and VAET entries for a single attribute.
   ;; Useful after adding or removing :db/index or :db/unique on an attribute.
 
-  (define (reindex-attribute! conn attr-ident)
+  (def (reindex-attribute! conn attr-ident)
     (let* ([current-db (db conn)]
            [indices    (db-value-indices current-db)]
            [schema     (db-value-schema current-db)]

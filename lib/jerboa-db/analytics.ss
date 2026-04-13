@@ -11,7 +11,16 @@
     export-parquet import-parquet import-csv
     analytics-close)
 
-  (import (chezscheme)
+  (import (except (chezscheme)
+                  make-hash-table hash-table?
+                  sort sort!
+                  printf fprintf
+                  path-extension path-absolute?
+                  with-input-from-string with-output-to-string
+                  iota 1+ 1-
+                  partition
+                  make-date make-time)
+          (jerboa prelude)
           (std db duckdb)
           (jerboa-db datom)
           (jerboa-db schema)
@@ -19,13 +28,13 @@
 
   ;; ---- Analytics engine record ----
 
-  (define-record-type analytics-engine
-    (fields (mutable duckdb-conn)     ;; DuckDB connection handle (integer)
-            (mutable last-synced-tx)  ;; last tx synced to DuckDB
-            schema-ref                ;; reference to schema registry
-            tx-log-ref))              ;; reference to transaction log
+  (defstruct analytics-engine
+    (duckdb-conn     ;; DuckDB connection handle (integer)
+     last-synced-tx  ;; last tx synced to DuckDB
+     schema-ref      ;; reference to schema registry
+     tx-log-ref))    ;; reference to transaction log
 
-  (define (new-analytics-engine schema tx-log . opts)
+  (def (new-analytics-engine schema tx-log . opts)
     ;; Optional: path for persistent DuckDB file
     (let ([path (if (pair? opts) (car opts) ":memory:")])
       (let ([conn (duckdb-open path)])
@@ -35,7 +44,7 @@
 
   ;; ---- Schema setup ----
 
-  (define (create-datom-table! ae)
+  (def (create-datom-table! ae)
     (duckdb-exec (analytics-engine-duckdb-conn ae)
       "CREATE TABLE IF NOT EXISTS datoms (
          e       BIGINT   NOT NULL,
@@ -53,7 +62,7 @@
 
   ;; ---- Sync from transaction log ----
 
-  (define (analytics-sync! ae)
+  (def (analytics-sync! ae)
     ;; Read transaction log entries since last-synced-tx and INSERT datoms.
     (let* ([log    (analytics-engine-tx-log-ref ae)]
            [schema (analytics-engine-schema-ref ae)]
@@ -71,7 +80,7 @@
         (analytics-engine-last-synced-tx-set! ae
           (tx-log-entry-tx-id (car (reverse entries)))))))
 
-  (define (insert-datom-row! ae schema dv)
+  (def (insert-datom-row! ae schema dv)
     ;; dv is a vector: #(e a v tx added?)
     (let* ([e      (vector-ref dv 0)]
            [a      (vector-ref dv 1)]
@@ -96,7 +105,7 @@
   ;; Map a datom value + schema type to the six typed column slots.
   ;; Returns six values: (v-long v-double v-string v-bool v-ref v-instant).
   ;; Exactly one will be non-#f (or all #f for unknown types).
-  (define (classify-value v vtype)
+  (def (classify-value v vtype)
     (cond
       ;; Explicit schema type wins
       [(eq? vtype 'db.type/long)
@@ -128,14 +137,14 @@
 
   ;; ---- SQL query ----
 
-  (define (analytics-query ae sql-string . params)
+  (def (analytics-query ae sql-string . params)
     ;; Sync first so the view is up-to-date, then run SQL.
     (analytics-sync! ae)
     (apply duckdb-query (analytics-engine-duckdb-conn ae) sql-string params))
 
   ;; ---- Parquet export ----
 
-  (define (export-parquet ae path . opts)
+  (def (export-parquet ae path . opts)
     ;; opts: optional SQL override (default: full datoms table)
     (analytics-sync! ae)
     (let ([sql (if (pair? opts)
@@ -149,7 +158,7 @@
   ;; Each row becomes a new entity assertion. All values imported as strings;
   ;; callers can add type coercion via the schema after import.
 
-  (define (import-parquet ae path mapping)
+  (def (import-parquet ae path mapping)
     (let ([conn (analytics-engine-duckdb-conn ae)]
           [schema (analytics-engine-schema-ref ae)]
           [tx-id  (+ (tx-log-latest-tx (analytics-engine-tx-log-ref ae)) 1)])
@@ -188,7 +197,7 @@
   ;; Same semantics as import-parquet — reads CSV via DuckDB's auto-detect,
   ;; then maps columns to attributes.
 
-  (define (import-csv ae path mapping)
+  (def (import-csv ae path mapping)
     (let ([conn   (analytics-engine-duckdb-conn ae)]
           [schema (analytics-engine-schema-ref ae)]
           [tx-id  (+ (tx-log-latest-tx (analytics-engine-tx-log-ref ae)) 1)])
@@ -221,7 +230,7 @@
 
   ;; ---- Close ----
 
-  (define (analytics-close ae)
+  (def (analytics-close ae)
     (duckdb-close (analytics-engine-duckdb-conn ae))
     (analytics-engine-duckdb-conn-set! ae #f))
 
@@ -229,9 +238,9 @@
 
   ;; Simple monotonic counter for import entity IDs.
   ;; Starts well above any normal entity range so imports don't collide.
-  (define *import-eid-counter* (expt 2 48))
+  (def *import-eid-counter* (expt 2 48))
 
-  (define (next-import-eid ae)
+  (def (next-import-eid ae)
     (let ([eid *import-eid-counter*])
       (set! *import-eid-counter* (+ *import-eid-counter* 1))
       eid))

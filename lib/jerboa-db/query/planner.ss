@@ -10,19 +10,28 @@
     clause-bound-vars clause-used-vars
     score-clause)
 
-  (import (chezscheme)
+  (import (except (chezscheme)
+                  make-hash-table hash-table?
+                  sort sort!
+                  printf fprintf
+                  path-extension path-absolute?
+                  with-input-from-string with-output-to-string
+                  iota 1+ 1-
+                  partition
+                  make-date make-time)
+          (jerboa prelude)
           (jerboa-db schema))
 
   ;; ---- Variable detection ----
 
-  (define (logic-var? x)
+  (def (logic-var? x)
     (and (symbol? x)
          (let ([s (symbol->string x)])
            (and (> (string-length s) 0)
                 (char=? (string-ref s 0) #\?)))))
 
   ;; Variables that a data-pattern clause binds (introduces)
-  (define (clause-bound-vars clause already-bound)
+  (def (clause-bound-vars clause already-bound)
     (filter (lambda (v) (and (logic-var? v) (not (memq v already-bound))))
             (cond
               ;; Not clause: (not sub-clause ...) — binds nothing (filter only)
@@ -52,7 +61,7 @@
               [else '()])))
 
   ;; Variables used (referenced) by a clause
-  (define (clause-used-vars clause)
+  (def (clause-used-vars clause)
     (cond
       ;; Not/or: collect vars from sub-clauses
       [(and (pair? clause) (memq (car clause) '(not or)))
@@ -66,7 +75,7 @@
   ;; ---- Selectivity scoring ----
   ;; Higher score = more selective = should come first.
 
-  (define (score-clause clause bound-vars schema)
+  (def (score-clause clause bound-vars schema)
     (cond
       ;; Not clause: should come after its sub-clause vars are bound.
       ;; Score low so it's placed late (it's a filter).
@@ -105,7 +114,7 @@
   ;; Greedy algorithm: pick the highest-scoring clause, add its bindings,
   ;; repeat until all clauses are placed.
 
-  (define (reorder-clauses clauses initial-bound-vars schema)
+  (def (reorder-clauses clauses initial-bound-vars schema)
     (let loop ([remaining clauses]
                [bound-vars initial-bound-vars]
                [result '()])
@@ -124,7 +133,7 @@
   ;; ---- Index selection ----
   ;; Choose which index to scan for a data pattern.
 
-  (define (choose-index pattern bound-vars schema)
+  (def (choose-index pattern bound-vars schema)
     ;; pattern: (?e attr ?v) or similar
     (let* ([e-pos (car pattern)]
            [a-pos (cadr pattern)]

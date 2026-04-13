@@ -25,40 +25,49 @@
     ;; Content hashing for variable-length values
     content-hash-bytes)
 
-  (import (chezscheme))
+  (import (except (chezscheme)
+                  make-hash-table hash-table?
+                  sort sort!
+                  printf fprintf
+                  path-extension path-absolute?
+                  with-input-from-string with-output-to-string
+                  iota 1+ 1-
+                  partition
+                  make-date make-time)
+          (jerboa prelude))
 
   ;; ---- Entity ID: big-endian unsigned 64-bit ----
 
-  (define (encode-eid eid)
+  (def (encode-eid eid)
     (let ([bv (make-bytevector 8 0)])
       (bytevector-u64-set! bv 0 eid (endianness big))
       bv))
 
-  (define (decode-eid bv offset)
+  (def (decode-eid bv offset)
     (bytevector-u64-ref bv offset (endianness big)))
 
   ;; ---- Attribute ID: big-endian unsigned 32-bit ----
 
-  (define (encode-aid aid)
+  (def (encode-aid aid)
     (let ([bv (make-bytevector 4 0)])
       (bytevector-u32-set! bv 0 aid (endianness big))
       bv))
 
-  (define (decode-aid bv offset)
+  (def (decode-aid bv offset)
     (bytevector-u32-ref bv offset (endianness big)))
 
   ;; ---- Transaction ID + added? flag ----
   ;; High bit of 64-bit tx: 0 = assertion, 1 = retraction
 
-  (define +retract-bit+ #x8000000000000000)
+  (def +retract-bit+ #x8000000000000000)
 
-  (define (encode-tx+op tx added?)
+  (def (encode-tx+op tx added?)
     (let ([bv (make-bytevector 8 0)]
           [encoded (if added? tx (bitwise-ior tx +retract-bit+))])
       (bytevector-u64-set! bv 0 encoded (endianness big))
       bv))
 
-  (define (decode-tx+op bv offset)
+  (def (decode-tx+op bv offset)
     (let ([raw (bytevector-u64-ref bv offset (endianness big))])
       (if (bitwise-bit-set? raw 63)
           (values (bitwise-and raw (- +retract-bit+ 1)) #f)  ;; retraction
@@ -68,7 +77,7 @@
   ;; Values that fit in 8 bytes are encoded inline.
   ;; Variable-length values are content-hashed to 8 bytes.
 
-  (define (encode-value-inline value type)
+  (def (encode-value-inline value type)
     (let ([bv (make-bytevector 8 0)])
       (case type
         [(db.type/long)
@@ -91,7 +100,7 @@
          (bytevector-copy! (content-hash-bytes value) 0 bv 0 8)])
       bv))
 
-  (define (decode-value-inline bv offset type)
+  (def (decode-value-inline bv offset type)
     (case type
       [(db.type/long)
        (- (bytevector-u64-ref bv offset (endianness big)) #x8000000000000000)]
@@ -107,14 +116,14 @@
        (bytevector-u64-ref bv offset (endianness big))]
       [else #f]))  ;; variable-length needs value-store lookup
 
-  (define (encode-value-hash value)
+  (def (encode-value-hash value)
     (content-hash-bytes value))
 
   ;; ---- Sortable IEEE 754 double encoding ----
   ;; XOR sign bit, flip all bits if negative.
   ;; This makes bytewise comparison equal numeric comparison.
 
-  (define (encode-f64-sortable d)
+  (def (encode-f64-sortable d)
     (let ([bv (make-bytevector 8)])
       (bytevector-ieee-double-set! bv 0 d (endianness big))
       (let ([high (bytevector-u8-ref bv 0)])
@@ -130,7 +139,7 @@
               (bytevector-u8-set! bv 0 (bitwise-xor high #x80))
               bv)))))
 
-  (define (decode-f64-sortable bv)
+  (def (decode-f64-sortable bv)
     (let ([high (bytevector-u8-ref bv 0)])
       (if (bitwise-bit-set? high 7)
           ;; Was positive: flip sign bit back
@@ -149,10 +158,10 @@
   ;; ---- Content hashing (FNV-1a 64-bit) ----
   ;; Used for variable-length values in index keys.
 
-  (define +fnv-offset+ 14695981039346656037)
-  (define +fnv-prime+  1099511628211)
+  (def +fnv-offset+ 14695981039346656037)
+  (def +fnv-prime+  1099511628211)
 
-  (define (content-hash-bytes value)
+  (def (content-hash-bytes value)
     (let* ([data (cond
                    [(string? value) (string->utf8 value)]
                    [(bytevector? value) value]
@@ -163,7 +172,7 @@
       (bytevector-u64-set! bv 0 hash (endianness big))
       bv))
 
-  (define (fnv1a-64 data)
+  (def (fnv1a-64 data)
     (let ([len (bytevector-length data)])
       (let loop ([i 0] [h +fnv-offset+])
         (if (>= i len)
@@ -175,7 +184,7 @@
 
   ;; ---- Full 28-byte index key construction ----
 
-  (define (encode-eavt-key e a v-hash tx added?)
+  (def (encode-eavt-key e a v-hash tx added?)
     (let ([bv (make-bytevector 28 0)])
       (bytevector-copy! (encode-eid e) 0 bv 0 8)
       (bytevector-copy! (encode-aid a) 0 bv 8 4)
@@ -183,7 +192,7 @@
       (bytevector-copy! (encode-tx+op tx added?) 0 bv 20 8)
       bv))
 
-  (define (encode-aevt-key a e v-hash tx added?)
+  (def (encode-aevt-key a e v-hash tx added?)
     (let ([bv (make-bytevector 28 0)])
       (bytevector-copy! (encode-aid a) 0 bv 0 4)
       (bytevector-copy! (encode-eid e) 0 bv 4 8)
@@ -191,7 +200,7 @@
       (bytevector-copy! (encode-tx+op tx added?) 0 bv 20 8)
       bv))
 
-  (define (encode-avet-key a v-hash e tx added?)
+  (def (encode-avet-key a v-hash e tx added?)
     (let ([bv (make-bytevector 28 0)])
       (bytevector-copy! (encode-aid a) 0 bv 0 4)
       (bytevector-copy! v-hash 0 bv 4 8)
@@ -199,7 +208,7 @@
       (bytevector-copy! (encode-tx+op tx added?) 0 bv 20 8)
       bv))
 
-  (define (encode-vaet-key v-hash a e tx added?)
+  (def (encode-vaet-key v-hash a e tx added?)
     (let ([bv (make-bytevector 28 0)])
       (bytevector-copy! v-hash 0 bv 0 8)
       (bytevector-copy! (encode-aid a) 0 bv 8 4)
@@ -209,19 +218,19 @@
 
   ;; ---- Key decoding ----
 
-  (define (decode-eavt-key bv)
+  (def (decode-eavt-key bv)
     (let-values ([(tx added?) (decode-tx+op bv 20)])
       (values (decode-eid bv 0) (decode-aid bv 8) tx added?)))
 
-  (define (decode-aevt-key bv)
+  (def (decode-aevt-key bv)
     (let-values ([(tx added?) (decode-tx+op bv 20)])
       (values (decode-aid bv 0) (decode-eid bv 4) tx added?)))
 
-  (define (decode-avet-key bv)
+  (def (decode-avet-key bv)
     (let-values ([(tx added?) (decode-tx+op bv 20)])
       (values (decode-aid bv 0) (decode-eid bv 12) tx added?)))
 
-  (define (decode-vaet-key bv)
+  (def (decode-vaet-key bv)
     (let-values ([(tx added?) (decode-tx+op bv 20)])
       (values (decode-aid bv 8) (decode-eid bv 12) tx added?)))
 

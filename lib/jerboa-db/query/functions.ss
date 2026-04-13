@@ -10,11 +10,20 @@
     apply-builtin-predicate apply-builtin-function
     resolve-builtin)
 
-  (import (chezscheme))
+  (import (except (chezscheme)
+                  make-hash-table hash-table?
+                  sort sort!
+                  printf fprintf
+                  path-extension path-absolute?
+                  with-input-from-string with-output-to-string
+                  iota 1+ 1-
+                  partition
+                  make-date make-time)
+          (jerboa prelude))
 
   ;; ---- Built-in predicates (return boolean, used for filtering) ----
 
-  (define builtin-predicates
+  (def builtin-predicates
     `((>  . ,>) (<  . ,<) (>= . ,>=) (<= . ,<=)
       (=  . ,=) (not= . ,(lambda (a b) (not (equal? a b))))
       (zero? . ,zero?) (pos? . ,positive?) (neg? . ,negative?)
@@ -36,7 +45,7 @@
 
   ;; ---- Built-in functions (return a value to bind) ----
 
-  (define builtin-functions
+  (def builtin-functions
     `((str . ,(lambda args
                 (apply string-append
                        (map (lambda (x)
@@ -68,22 +77,22 @@
 
   ;; ---- Lookup ----
 
-  (define (builtin-predicate? name)
+  (def (builtin-predicate? name)
     (assq name builtin-predicates))
 
-  (define (builtin-function? name)
+  (def (builtin-function? name)
     (assq name builtin-functions))
 
-  (define (resolve-builtin name)
+  (def (resolve-builtin name)
     (or (let ([p (assq name builtin-predicates)]) (and p (cdr p)))
         (let ([f (assq name builtin-functions)])  (and f (cdr f)))
         #f))
 
-  (define (apply-builtin-predicate name args)
+  (def (apply-builtin-predicate name args)
     (let ([proc (cdr (assq name builtin-predicates))])
       (apply proc args)))
 
-  (define (apply-builtin-function name args)
+  (def (apply-builtin-function name args)
     (let ([proc (cdr (assq name builtin-functions))])
       (apply proc args)))
 

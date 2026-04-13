@@ -13,7 +13,16 @@
 
     process-transaction tempid tempid?)
 
-  (import (chezscheme)
+  (import (except (chezscheme)
+                  make-hash-table hash-table?
+                  sort sort!
+                  printf fprintf
+                  path-extension path-absolute?
+                  with-input-from-string with-output-to-string
+                  iota 1+ 1-
+                  partition
+                  make-date make-time)
+          (jerboa prelude)
           (jerboa-db datom)
           (jerboa-db schema)
           (jerboa-db index protocol)
@@ -21,22 +30,22 @@
 
   ;; ---- Transaction report ----
 
-  (define-record-type tx-report
-    (fields db-before  ;; db-value before transaction
-            db-after   ;; db-value after transaction
-            tx-data    ;; list of datoms produced
-            tempids))  ;; alist: tempid -> permanent eid
+  (defstruct tx-report
+    (db-before  ;; db-value before transaction
+     db-after   ;; db-value after transaction
+     tx-data    ;; list of datoms produced
+     tempids))  ;; alist: tempid -> permanent eid
 
   ;; ---- Tempids ----
   ;; Negative integers serve as temporary IDs within a transaction.
 
-  (define tempid-counter 0)
+  (def tempid-counter 0)
 
-  (define (tempid)
+  (def (tempid)
     (set! tempid-counter (- tempid-counter 1))
     tempid-counter)
 
-  (define (tempid? x)
+  (def (tempid? x)
     (and (integer? x) (< x 0)))
 
   ;; ---- Transaction processing ----
@@ -51,7 +60,7 @@
   ;;   - tempid-map: alist of tempid -> permanent eid
   ;;   - datoms: accumulated datoms to write
 
-  (define (process-transaction db tx-ops next-eid-cell)
+  (def (process-transaction db tx-ops next-eid-cell)
     (let* ([schema (db-value-schema db)]
            [indices (db-value-indices db)]
            [tx-id (+ (db-value-basis-tx db) 1)]
@@ -178,7 +187,7 @@
                     (let ([d (vector-ref vals i)])
                       (if (datom-added? d)
                           d
-                          (loop (+ i 1))))))))))
+                          (loop (+ i 1)))))))))  )
 
       (define (emit-datom! e a v added?)
         (set! produced-datoms

@@ -8,7 +8,16 @@
 (library (jerboa-db query engine)
   (export query-db parse-query explain-query)
 
-  (import (chezscheme)
+  (import (except (chezscheme)
+                  make-hash-table hash-table?
+                  sort sort!
+                  printf fprintf
+                  path-extension path-absolute?
+                  with-input-from-string with-output-to-string
+                  iota 1+ 1-
+                  partition
+                  make-date make-time)
+          (jerboa prelude)
           (jerboa-db datom)
           (jerboa-db schema)
           (jerboa-db index protocol)
@@ -20,7 +29,7 @@
 
   ;; ---- Logic variable helpers ----
 
-  (define (logic-var? x)
+  (def (logic-var? x)
     (and (symbol? x)
          (> (string-length (symbol->string x)) 0)
          (char=? (string-ref (symbol->string x) 0) #\?)))
@@ -30,17 +39,17 @@
   ;; O(1) lookup vs O(n) for alists. Copy-on-extend preserves immutability
   ;; across the binding-set list used during clause evaluation.
 
-  (define (make-empty-bindings) (make-hashtable symbol-hash eq?))
+  (def (make-empty-bindings) (make-hashtable symbol-hash eq?))
 
-  (define (binding-ref bindings var)
+  (def (binding-ref bindings var)
     (hashtable-ref bindings var #f))
 
-  (define (binding-set bindings var val)
+  (def (binding-set bindings var val)
     (let ([new-ht (hashtable-copy bindings #t)])
       (hashtable-set! new-ht var val)
       new-ht))
 
-  (define (resolve-in-bindings bindings x)
+  (def (resolve-in-bindings bindings x)
     (if (logic-var? x)
         (binding-ref bindings x)
         x))
@@ -49,13 +58,13 @@
   ;; Query format: ((find vars...) (in inputs...) (where clauses...))
   ;; All sections are identified by their car symbol.
 
-  (define-record-type parsed-query
-    (fields find-vars    ;; list of symbols or (agg ?var) forms
-            in-vars      ;; list of input symbols ($ = db)
-            where-clauses ;; list of clause forms
-            rules))      ;; parsed rule definitions or #f
+  (defstruct parsed-query
+    (find-vars    ;; list of symbols or (agg ?var) forms
+     in-vars      ;; list of input symbols ($ = db)
+     where-clauses ;; list of clause forms
+     rules))      ;; parsed rule definitions or #f
 
-  (define (parse-query form)
+  (def (parse-query form)
     (let ([find-clause #f]
           [in-clause '($)]
           [where-clause '()]
@@ -80,7 +89,7 @@
   ;; triple, the datom with the highest tx determines current state. If it's an
   ;; assertion, the value is live; if a retraction, the value is gone.
 
-  (define (resolve-current-datoms datoms)
+  (def (resolve-current-datoms datoms)
     ;; Fast path: if no retractions in the scanned range, every datom is a current
     ;; assertion — skip the hashtable entirely. This is the common case for
     ;; freshly-written or lightly-updated databases.
@@ -102,7 +111,7 @@
   ;; ---- Data pattern evaluation ----
   ;; A data pattern like (?e person/name ?name) is matched against an index.
 
-  (define (evaluate-data-pattern db pattern bindings schema)
+  (def (evaluate-data-pattern db pattern bindings schema)
     ;; pattern: (e-spec a-spec v-spec) or (e-spec a-spec v-spec tx-spec)
     ;; or (e-spec a-spec v-spec tx-spec op-spec)
     (let* ([e-spec (car pattern)]
@@ -168,11 +177,11 @@
                                                       tx-spec op-spec bindings)])
                   (if new-bindings
                       (loop (cdr ds) (cons new-bindings results))
-                      (loop (cdr ds) results)))))))))
+                      (loop (cdr ds) results))))))))
 
   ;; Try to unify a datom with the pattern, extending bindings.
   ;; Returns extended bindings or #f if unification fails.
-  (define (try-unify-datom d e-spec a-spec v-spec tx-spec op-spec bindings)
+  (def (try-unify-datom d e-spec a-spec v-spec tx-spec op-spec bindings)
     (define (unify spec actual binds)
       (cond
         [(eq? spec '_) binds]  ;; wildcard
@@ -192,7 +201,7 @@
   ;; ---- Predicate clause evaluation ----
   ;; ((pred arg1 arg2 ...)) — returns filtered bindings
 
-  (define (evaluate-predicate-clause clause bindings)
+  (def (evaluate-predicate-clause clause bindings)
     (let* ([form (car clause)]
            [pred-name (car form)]
            [args (cdr form)]
@@ -205,7 +214,7 @@
   ;; ---- Function clause evaluation ----
   ;; ((fn arg1 arg2 ...) ?result) — computes and binds result
 
-  (define (evaluate-function-clause clause bindings)
+  (def (evaluate-function-clause clause bindings)
     (let* ([form (car clause)]
            [fn-name (car form)]
            [args (cdr form)]
@@ -218,7 +227,7 @@
 
   ;; ---- Clause classification ----
 
-  (define (data-pattern? clause)
+  (def (data-pattern? clause)
     ;; A data pattern: (something attr-symbol something ...)
     ;; First element is a var or literal, second is a symbol (attribute)
     (and (pair? clause)
@@ -227,23 +236,23 @@
          (symbol? (cadr clause))
          (not (logic-var? (cadr clause)))))
 
-  (define (predicate-clause? clause)
+  (def (predicate-clause? clause)
     ;; ((pred args...)) — single nested list, no result binding
     (and (pair? clause) (pair? (car clause)) (null? (cdr clause))))
 
-  (define (function-clause? clause)
+  (def (function-clause? clause)
     ;; ((fn args...) ?result) — nested list + result variable
     (and (pair? clause) (pair? (car clause)) (pair? (cdr clause))))
 
-  (define (not-clause? clause)
+  (def (not-clause? clause)
     ;; (not sub-clause ...) — negation
     (and (pair? clause) (eq? (car clause) 'not)))
 
-  (define (or-clause? clause)
+  (def (or-clause? clause)
     ;; (or alt1 alt2 ...) — disjunction
     (and (pair? clause) (eq? (car clause) 'or)))
 
-  (define (rule-invocation? clause rules-ht)
+  (def (rule-invocation? clause rules-ht)
     ;; (rule-name args...) where rule-name is in the rule registry
     (and (pair? clause)
          (symbol? (car clause))
@@ -256,7 +265,7 @@
 
   ;; Parse a comparison form (op a b) where one arg matches v-spec and the other
   ;; is a literal constant.  Returns (lo hi lo-strict? hi-strict?) or #f.
-  (define (parse-range-predicate pred-form v-spec)
+  (def (parse-range-predicate pred-form v-spec)
     (and (pair? pred-form)
          (memq (car pred-form) '(< <= > >=))
          (= (length pred-form) 3)
@@ -281,7 +290,7 @@
              [else #f]))))
 
   ;; Combine two range bound specs.  Takes the tighter of each bound.
-  (define (merge-range-bounds b1 b2)
+  (def (merge-range-bounds b1 b2)
     (if (not b2) b1
         (list (or (car b1)   (car b2))
               (or (cadr b1)  (cadr b2))
@@ -290,7 +299,7 @@
 
   ;; Evaluate a data pattern using a pre-computed AVET range instead of a
   ;; full attribute scan.  bounds = (lo hi lo-strict? hi-strict?).
-  (define (evaluate-data-pattern-in-range db pattern bindings schema bounds)
+  (def (evaluate-data-pattern-in-range db pattern bindings schema bounds)
     (let* ([e-spec    (car pattern)]
            [a-spec    (cadr pattern)]
            [v-spec    (caddr pattern)]
@@ -327,7 +336,7 @@
 
   ;; ---- Main query evaluation ----
 
-  (define (evaluate-where-clauses db clauses bindings-list schema rules-ht)
+  (def (evaluate-where-clauses db clauses bindings-list schema rules-ht)
     (if (null? clauses)
         bindings-list
         (let* ([clause   (car clauses)]
@@ -386,7 +395,7 @@
               '()
               (evaluate-where-clauses db eval-rest new-bindings-list schema rules-ht)))))
 
-  (define (evaluate-single-clause db clause bindings schema rules-ht)
+  (def (evaluate-single-clause db clause bindings schema rules-ht)
     (cond
       [(not-clause? clause)
        (evaluate-not-clause db clause bindings schema rules-ht)]
@@ -404,7 +413,7 @@
 
   ;; ---- Rule evaluation ----
 
-  (define (evaluate-rule-clause db clause bindings schema rules-ht)
+  (def (evaluate-rule-clause db clause bindings schema rules-ht)
     (let* ([name (car clause)]
            [args (cdr clause)]
            [alternatives (expand-rule-invocation name args rules-ht)])
@@ -417,7 +426,7 @@
   ;; ---- Not clause evaluation ----
   ;; (not sub-clause ...) — exclude bindings for which sub-clauses match.
 
-  (define (evaluate-not-clause db clause bindings schema rules-ht)
+  (def (evaluate-not-clause db clause bindings schema rules-ht)
     (let* ([sub-clauses (cdr clause)]
            ;; Evaluate sub-clauses starting from current bindings
            [results (evaluate-where-clauses db sub-clauses (list bindings) schema rules-ht)])
@@ -429,7 +438,7 @@
   ;; ---- Or clause evaluation ----
   ;; (or alt1 alt2 ...) — union of bindings from each alternative.
 
-  (define (evaluate-or-clause db clause bindings schema rules-ht)
+  (def (evaluate-or-clause db clause bindings schema rules-ht)
     (let ([alternatives (cdr clause)])
       (apply append
         (map (lambda (alt)
@@ -440,7 +449,7 @@
   ;; ---- Find clause processing ----
   ;; Extract result tuples from bindings based on :find specification.
 
-  (define (extract-find-results find-vars bindings-list)
+  (def (extract-find-results find-vars bindings-list)
     (let ([has-aggregates? (any-aggregates? find-vars)])
       (if has-aggregates?
           (apply-aggregates find-vars bindings-list)
@@ -453,10 +462,10 @@
                         find-vars))
                  bindings-list)))))
 
-  (define (any-aggregates? find-vars)
+  (def (any-aggregates? find-vars)
     (exists (lambda (v) (and (pair? v) (aggregate? (car v)))) find-vars))
 
-  (define (apply-aggregates find-vars bindings-list)
+  (def (apply-aggregates find-vars bindings-list)
     ;; Fast path: single (count ?x) with no grouping vars — just count rows.
     ;; Skips group-bindings hashtable construction and per-row value extraction.
     (if (and (= 1 (length find-vars))
@@ -490,7 +499,7 @@
                     find-vars)))
            groups))))
 
-  (define (group-bindings grouping-vars bindings-list)
+  (def (group-bindings grouping-vars bindings-list)
     ;; Group bindings by the values of grouping-vars.
     ;; Returns: list of (group-key . bindings-list)
     (let ([ht (make-hashtable equal-hash equal?)])
@@ -507,7 +516,7 @@
         (map cons (vector->list keys) (vector->list vals)))))
 
   ;; Remove duplicate result tuples
-  (define (deduplicate-results results)
+  (def (deduplicate-results results)
     (let ([ht (make-hashtable equal-hash equal?)])
       (let loop ([rs results] [out '()])
         (if (null? rs)
@@ -521,7 +530,7 @@
 
   ;; ---- Top-level query function ----
 
-  (define (query-db parsed db . inputs)
+  (def (query-db parsed db . inputs)
     (let* ([schema (db-value-schema db)]
            [find-vars (parsed-query-find-vars parsed)]
            [in-vars (parsed-query-in-vars parsed)]
@@ -610,7 +619,7 @@
       (extract-find-results find-vars result-bindings)))
 
   ;; Helper: find position of element in list
-  (define (list-index pred lst)
+  (def (list-index pred lst)
     (let loop ([l lst] [i 0])
       (cond [(null? l) #f]
             [(pred (car l)) i]
@@ -619,7 +628,7 @@
   ;; ---- Query explain ----
   ;; Returns the query plan (clause ordering, chosen indices) without executing.
 
-  (define (explain-query query-form db-val . inputs)
+  (def (explain-query query-form db-val . inputs)
     (let* ([parsed (parse-query query-form)]
            [schema (db-value-schema db-val)]
            [find-vars (parsed-query-find-vars parsed)]

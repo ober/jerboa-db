@@ -20,14 +20,13 @@ test-lmdb:
 # Compile all libraries (catches syntax/import errors)
 build:
 	@echo "Compiling jerboa-db libraries..."
-	$(SCHEME) --libdirs "$(LIBDIRS)" --program /dev/null \
-		--import-notify <<< '(import (jerboa-db core))' 2>&1 || true
+	printf '(import (jerboa-db core))\n' | $(SCHEME) --libdirs "$(LIBDIRS)"
 	@echo "Build check complete."
 
-# Syntax check all .sls files
+# Syntax check all .ss files
 check:
 	@echo "Checking library files..."
-	@for f in $$(find lib -name "*.sls"); do \
+	@for f in $$(find lib -name "*.ss"); do \
 		echo "  $$f"; \
 		$(SCHEME) --libdirs "$(LIBDIRS)" --script /dev/null 2>&1 | head -5 || true; \
 	done

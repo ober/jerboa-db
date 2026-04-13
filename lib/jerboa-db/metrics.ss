@@ -17,7 +17,16 @@
     ;; Reset
     metrics-reset!)
 
-  (import (chezscheme)
+  (import (except (chezscheme)
+                  make-hash-table hash-table?
+                  sort sort!
+                  printf fprintf
+                  path-extension path-absolute?
+                  with-input-from-string with-output-to-string
+                  iota 1+ 1-
+                  partition
+                  make-date make-time)
+          (jerboa prelude)
           (jerboa-db cache)
           (jerboa-db index protocol)
           (jerboa-db history)
@@ -27,25 +36,25 @@
   ;; All metrics are mutable cells.
 
   ;; Transaction metrics
-  (define tx-total           (list 0))   ;; (mutable integer)
-  (define tx-duration-min-ns (list #f))  ;; #f until first record
-  (define tx-duration-max-ns (list 0))
-  (define tx-duration-sum-ns (list 0))
+  (def tx-total           (list 0))   ;; (mutable integer)
+  (def tx-duration-min-ns (list #f))  ;; #f until first record
+  (def tx-duration-max-ns (list 0))
+  (def tx-duration-sum-ns (list 0))
 
   ;; Query metrics
-  (define query-total           (list 0))
-  (define query-duration-min-ns (list #f))
-  (define query-duration-max-ns (list 0))
-  (define query-duration-sum-ns (list 0))
+  (def query-total           (list 0))
+  (def query-duration-min-ns (list #f))
+  (def query-duration-max-ns (list 0))
+  (def query-duration-sum-ns (list 0))
 
   ;; Helpers for mutable cell access
-  (define (cell-get c) (car c))
-  (define (cell-set! c v) (set-car! c v))
+  (def (cell-get c) (car c))
+  (def (cell-set! c v) (set-car! c v))
 
   ;; ---- record-tx-metric! ----
   ;; duration-ns: transaction duration in nanoseconds (positive integer)
 
-  (define (record-tx-metric! duration-ns)
+  (def (record-tx-metric! duration-ns)
     (cell-set! tx-total (+ (cell-get tx-total) 1))
     (cell-set! tx-duration-sum-ns (+ (cell-get tx-duration-sum-ns) duration-ns))
     (let ([cur-min (cell-get tx-duration-min-ns)])
@@ -57,7 +66,7 @@
   ;; ---- record-query-metric! ----
   ;; duration-ns: query duration in nanoseconds (positive integer)
 
-  (define (record-query-metric! duration-ns)
+  (def (record-query-metric! duration-ns)
     (cell-set! query-total (+ (cell-get query-total) 1))
     (cell-set! query-duration-sum-ns (+ (cell-get query-duration-sum-ns) duration-ns))
     (let ([cur-min (cell-get query-duration-min-ns)])
@@ -70,7 +79,7 @@
   ;; Returns an alist of all current metric values.
   ;; conn is optional: if provided, live index counts and cache ratio are included.
 
-  (define (metrics-snapshot . args)
+  (def (metrics-snapshot . args)
     (let* ([conn (and (pair? args) (car args))]
            [tx-count  (cell-get tx-total)]
            [q-count   (cell-get query-total)]
@@ -104,10 +113,10 @@
   ;; Returns a string in Prometheus exposition format.
   ;; conn is optional (same as metrics-snapshot).
 
-  (define (metrics-prometheus . args)
+  (def (metrics-prometheus . args)
     (let* ([snap (apply metrics-snapshot args)]
            [lines '()])
-      (define (emit! name help type value)
+      (def (emit! name help type value)
         (set! lines
               (cons (string-append
                       "# HELP jerboa_db_" name " " help "\n"
@@ -118,7 +127,7 @@
                                                    value))
                       "\n")
                     lines)))
-      (define (get key) (let ([p (assq key snap)]) (if p (cdr p) 0)))
+      (def (get key) (let ([p (assq key snap)]) (if p (cdr p) 0)))
       (emit! "transactions_total"
              "Total number of transactions processed"
              "counter"
@@ -167,7 +176,7 @@
   ;; ---- metrics-reset! ----
   ;; Reset all counters (useful between test runs).
 
-  (define (metrics-reset!)
+  (def (metrics-reset!)
     (cell-set! tx-total 0)
     (cell-set! tx-duration-min-ns #f)
     (cell-set! tx-duration-max-ns 0)

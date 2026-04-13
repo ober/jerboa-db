@@ -35,34 +35,43 @@
     ;; Bootstrap
     bootstrap-schema!)
 
-  (import (chezscheme))
+  (import (except (chezscheme)
+                  make-hash-table hash-table?
+                  sort sort!
+                  printf fprintf
+                  path-extension path-absolute?
+                  with-input-from-string with-output-to-string
+                  iota 1+ 1-
+                  partition
+                  make-date make-time)
+          (jerboa prelude))
 
   ;; ---- Attribute record ----
 
-  (define-record-type db-attribute
-    (fields ident          ;; symbol (e.g., person/name)
-            id             ;; integer (interned for index keys)
-            value-type     ;; symbol: db.type/string, db.type/long, etc.
-            cardinality    ;; symbol: db.cardinality/one or db.cardinality/many
-            unique         ;; #f, db.unique/value, or db.unique/identity
-            index?         ;; boolean — populate AVET?
-            is-component?  ;; boolean — cascade retractions?
-            doc            ;; string or #f
-            no-history?    ;; boolean — skip history?
-            tuple-attrs    ;; list of component attr ident symbols for composite, or #f
-            fulltext?))    ;; boolean — enable fulltext indexing
+  (defstruct db-attribute
+    (ident          ;; symbol (e.g., person/name)
+     id             ;; integer (interned for index keys)
+     value-type     ;; symbol: db.type/string, db.type/long, etc.
+     cardinality    ;; symbol: db.cardinality/one or db.cardinality/many
+     unique         ;; #f, db.unique/value, or db.unique/identity
+     index?         ;; boolean — populate AVET?
+     is-component?  ;; boolean — cascade retractions?
+     doc            ;; string or #f
+     no-history?    ;; boolean — skip history?
+     tuple-attrs    ;; list of component attr ident symbols for composite, or #f
+     fulltext?))    ;; boolean — enable fulltext indexing
 
   ;; ---- Schema registry ----
   ;; Maps ident (symbol) <-> id (integer), and id -> db-attribute.
 
-  (define-record-type schema-registry
-    (fields (mutable ident->id)    ;; hashtable: symbol -> integer
-            (mutable id->attr)     ;; hashtable: integer -> db-attribute
-            (mutable next-id)))    ;; integer: next attribute ID to assign
+  (defstruct schema-registry
+    (ident->id    ;; hashtable: symbol -> integer
+     id->attr     ;; hashtable: integer -> db-attribute
+     next-id))    ;; integer: next attribute ID to assign
 
-  ;; The raw constructor from define-record-type is make-schema-registry.
+  ;; The raw constructor from defstruct is make-schema-registry.
   ;; We wrap it to add bootstrapping.
-  (define (new-schema-registry)
+  (def (new-schema-registry)
     (let ([r (make-schema-registry
                (make-hashtable symbol-hash eq?)
                (make-eq-hashtable)
@@ -70,11 +79,11 @@
       (bootstrap-schema! r)
       r))
 
-  (define (schema-next-attr-id reg)
+  (def (schema-next-attr-id reg)
     (schema-registry-next-id reg))
 
   ;; Intern a new attribute ident -> id mapping
-  (define (schema-intern-attr! reg ident)
+  (def (schema-intern-attr! reg ident)
     (let ([ht (schema-registry-ident->id reg)])
       (or (hashtable-ref ht ident #f)
           (let ([id (schema-registry-next-id reg)])
@@ -83,7 +92,7 @@
             id))))
 
   ;; Install a fully defined attribute
-  (define (schema-install-attribute! reg attr)
+  (def (schema-install-attribute! reg attr)
     (let ([ident (db-attribute-ident attr)]
           [id (db-attribute-id attr)])
       (hashtable-set! (schema-registry-ident->id reg) ident id)
@@ -91,40 +100,40 @@
       (when (>= id (schema-registry-next-id reg))
         (schema-registry-next-id-set! reg (+ id 1)))))
 
-  (define (schema-lookup-by-ident reg ident)
+  (def (schema-lookup-by-ident reg ident)
     (let ([id (hashtable-ref (schema-registry-ident->id reg) ident #f)])
       (and id (hashtable-ref (schema-registry-id->attr reg) id #f))))
 
-  (define (schema-lookup-by-id reg id)
+  (def (schema-lookup-by-id reg id)
     (hashtable-ref (schema-registry-id->attr reg) id #f))
 
-  (define (schema-all-attributes reg)
+  (def (schema-all-attributes reg)
     (let-values ([(keys vals) (hashtable-entries (schema-registry-id->attr reg))])
       (vector->list vals)))
 
   ;; ---- Built-in attribute idents ----
 
-  (define +db/ident+       'db/ident)
-  (define +db/valueType+   'db/valueType)
-  (define +db/cardinality+ 'db/cardinality)
-  (define +db/unique+      'db/unique)
-  (define +db/index+       'db/index)
-  (define +db/doc+         'db/doc)
-  (define +db/isComponent+ 'db/isComponent)
-  (define +db/noHistory+   'db/noHistory)
-  (define +db/txInstant+   'db/txInstant)
-  (define +db/id+          'db/id)
-  (define +db/tupleAttrs+  'db/tupleAttrs)
-  (define +db/ensure+      'db/ensure)
-  (define +db/fulltext+    'db/fulltext)
-  (define +spec/ident+     'spec/ident)
-  (define +spec/attrs+     'spec/attrs)
+  (def +db/ident+       'db/ident)
+  (def +db/valueType+   'db/valueType)
+  (def +db/cardinality+ 'db/cardinality)
+  (def +db/unique+      'db/unique)
+  (def +db/index+       'db/index)
+  (def +db/doc+         'db/doc)
+  (def +db/isComponent+ 'db/isComponent)
+  (def +db/noHistory+   'db/noHistory)
+  (def +db/txInstant+   'db/txInstant)
+  (def +db/id+          'db/id)
+  (def +db/tupleAttrs+  'db/tupleAttrs)
+  (def +db/ensure+      'db/ensure)
+  (def +db/fulltext+    'db/fulltext)
+  (def +spec/ident+     'spec/ident)
+  (def +spec/attrs+     'spec/attrs)
 
-  (define +first-user-attr-id+ 20)
+  (def +first-user-attr-id+ 20)
 
   ;; ---- Bootstrap built-in schema attributes ----
 
-  (define (bootstrap-schema! reg)
+  (def (bootstrap-schema! reg)
     (define (install! id ident vtype card)
       (let ([attr (make-db-attribute ident id vtype card #f #t #f #f #f #f #f)])
         (schema-install-attribute! reg attr)))
@@ -147,13 +156,13 @@
 
   ;; ---- Value type validation ----
 
-  (define (valid-value-type? vtype)
+  (def (valid-value-type? vtype)
     (memq vtype '(db.type/string db.type/long db.type/double
                   db.type/boolean db.type/instant db.type/uuid
                   db.type/ref db.type/keyword db.type/bytes
                   db.type/symbol db.type/tuple db.type/any)))
 
-  (define (value-matches-type? vtype value)
+  (def (value-matches-type? vtype value)
     (case vtype
       [(db.type/string)  (string? value)]
       [(db.type/long)    (and (integer? value) (exact? value))]
@@ -169,7 +178,7 @@
       [(db.type/any)     #t]
       [else #f]))
 
-  (define (coerce-value vtype raw)
+  (def (coerce-value vtype raw)
     ;; Attempt basic coercion; return raw if it already matches.
     (if (value-matches-type? vtype raw)
         raw
@@ -193,23 +202,23 @@
 
   ;; ---- Convenience predicates ----
 
-  (define (cardinality-one? attr)
+  (def (cardinality-one? attr)
     (eq? (db-attribute-cardinality attr) 'db.cardinality/one))
 
-  (define (cardinality-many? attr)
+  (def (cardinality-many? attr)
     (eq? (db-attribute-cardinality attr) 'db.cardinality/many))
 
-  (define (ref-type? attr)
+  (def (ref-type? attr)
     (eq? (db-attribute-value-type attr) 'db.type/ref))
 
-  (define (indexed-attr? attr)
+  (def (indexed-attr? attr)
     (or (db-attribute-index? attr)
         (db-attribute-unique attr)))
 
   ;; avet-eligible?: should this attribute be stored in the AVET index?
   ;; True for all scalar (non-ref, non-tuple) attributes.
   ;; Ref types use VAET for reverse lookups; tuple/any values are not AVET-indexable.
-  (define (avet-eligible? attr)
+  (def (avet-eligible? attr)
     (and attr
          (not (memq (db-attribute-value-type attr)
                     '(db.type/ref db.type/tuple db.type/any)))))

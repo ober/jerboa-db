@@ -10,7 +10,16 @@
     fulltext-index-datoms! fulltext-remove-datoms!
     ft-search fulltext-stats)
 
-  (import (chezscheme)
+  (import (except (chezscheme)
+                  make-hash-table hash-table?
+                  sort sort!
+                  printf fprintf
+                  path-extension path-absolute?
+                  with-input-from-string with-output-to-string
+                  iota 1+ 1-
+                  partition
+                  make-date make-time)
+          (jerboa prelude)
           (jerboa-db datom)
           (jerboa-db schema))
 
@@ -18,21 +27,21 @@
   ;; word-table: hashtable word -> list of (eid . attr-id)
   ;; value-table: hashtable (eid . attr-id) -> value string
 
-  (define-record-type ft-idx
-    (fields (mutable word-table)
-            (mutable value-table)
-            (mutable entry-count)))
+  (defstruct ft-idx
+    (word-table
+     value-table
+     entry-count))
 
-  (define (make-fulltext-index)
+  (def (make-fulltext-index)
     (make-ft-idx (make-hashtable string-hash string=?)
                  (make-hashtable equal-hash equal?)
                  0))
 
-  (define (fulltext-index? x) (ft-idx? x))
+  (def (fulltext-index? x) (ft-idx? x))
 
   ;; ---- Tokenization ----
 
-  (define (tokenize str)
+  (def (tokenize str)
     (let loop ([chars (string->list str)] [current '()] [result '()])
       (cond
         [(null? chars)
@@ -51,7 +60,7 @@
 
   ;; ---- Indexing ----
 
-  (define (fulltext-index-datoms! ft schema datoms)
+  (def (fulltext-index-datoms! ft schema datoms)
     (for-each
       (lambda (d)
         (let ([attr (schema-lookup-by-id schema (datom-a d))])
@@ -61,7 +70,7 @@
                 (remove-value! ft (datom-e d) (datom-a d) (datom-v d))))))
       datoms))
 
-  (define (fulltext-remove-datoms! ft schema datoms)
+  (def (fulltext-remove-datoms! ft schema datoms)
     (for-each
       (lambda (d)
         (let ([attr (schema-lookup-by-id schema (datom-a d))])
@@ -69,7 +78,7 @@
             (remove-value! ft (datom-e d) (datom-a d) (datom-v d)))))
       datoms))
 
-  (define (index-value! ft eid attr-id value)
+  (def (index-value! ft eid attr-id value)
     (let ([key (cons eid attr-id)]
           [wt  (ft-idx-word-table ft)]
           [vt  (ft-idx-value-table ft)])
@@ -86,7 +95,7 @@
         (tokenize value))
       (ft-idx-entry-count-set! ft (+ (ft-idx-entry-count ft) 1))))
 
-  (define (remove-value! ft eid attr-id value)
+  (def (remove-value! ft eid attr-id value)
     (let ([key (cons eid attr-id)]
           [wt  (ft-idx-word-table ft)]
           [vt  (ft-idx-value-table ft)])
@@ -95,7 +104,7 @@
       (when (> (ft-idx-entry-count ft) 0)
         (ft-idx-entry-count-set! ft (- (ft-idx-entry-count ft) 1)))))
 
-  (define (remove-words! wt key words)
+  (def (remove-words! wt key words)
     (for-each
       (lambda (word)
         (let ([existing (hashtable-ref wt word '())])
@@ -110,7 +119,7 @@
   ;; Returns list of (eid . value) pairs for entities whose attr value
   ;; contains text as a substring (case-insensitive word-level match).
 
-  (define (ft-search ft schema attr-ident text)
+  (def (ft-search ft schema attr-ident text)
     (let ([attr (schema-lookup-by-ident schema attr-ident)])
       (unless attr
         (error 'ft-search "Unknown attribute" attr-ident))
@@ -140,17 +149,17 @@
 
   ;; ---- Stats ----
 
-  (define (fulltext-stats ft)
+  (def (fulltext-stats ft)
     (let-values ([(words _) (hashtable-entries (ft-idx-word-table ft))])
       (list (cons 'indexed-values (ft-idx-entry-count ft))
             (cons 'unique-words (vector-length words)))))
 
   ;; ---- Utilities ----
 
-  (define (string-downcase* s)
+  (def (string-downcase* s)
     (list->string (map char-downcase (string->list s))))
 
-  (define (string-contains? haystack needle)
+  (def (string-contains? haystack needle)
     (let ([hlen (string-length haystack)]
           [nlen (string-length needle)])
       (if (zero? nlen)
@@ -161,7 +170,7 @@
               [(string=? (substring haystack i (+ i nlen)) needle) #t]
               [else (loop (+ i 1))])))))
 
-  (define (filter-map f lst)
+  (def (filter-map f lst)
     (let loop ([lst lst] [acc '()])
       (if (null? lst) (reverse acc)
           (let ([r (f (car lst))])

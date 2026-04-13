@@ -13,25 +13,34 @@
     value-store-put! value-store-get value-store-has?
     value-store-close value-store-stats)
 
-  (import (chezscheme)
+  (import (except (chezscheme)
+                  make-hash-table hash-table?
+                  sort sort!
+                  printf fprintf
+                  path-extension path-absolute?
+                  with-input-from-string with-output-to-string
+                  iota 1+ 1-
+                  partition
+                  make-date make-time)
+          (jerboa prelude)
           (jerboa-db encoding))
 
   ;; ---- Record ----
 
-  (define-record-type vs-rec
-    (fields (mutable table)        ;; equal-hash hashtable: bv-hash -> value
-            (mutable hit-count)
-            (mutable miss-count)
-            (mutable dedup-count)))
+  (defstruct vs-rec
+    (table        ;; equal-hash hashtable: bv-hash -> value
+     hit-count
+     miss-count
+     dedup-count))
 
-  (define (value-store? x) (vs-rec? x))
+  (def (value-store? x) (vs-rec? x))
 
-  (define (make-value-store)
+  (def (make-value-store)
     (make-vs-rec (make-hashtable equal-hash equal?) 0 0 0))
 
   ;; ---- Operations ----
 
-  (define (value-store-put! vs value)
+  (def (value-store-put! vs value)
     ;; Returns 8-byte hash bytevector. Deduplicates on second call.
     (let ([hash-bv (content-hash-bytes value)])
       (if (hashtable-contains? (vs-rec-table vs) hash-bv)
@@ -42,20 +51,20 @@
             (hashtable-set! (vs-rec-table vs) hash-bv value)
             hash-bv))))
 
-  (define (value-store-get vs hash-bv)
+  (def (value-store-get vs hash-bv)
     (let ([v (hashtable-ref (vs-rec-table vs) hash-bv #f)])
       (if v
           (begin (vs-rec-hit-count-set! vs (+ (vs-rec-hit-count vs) 1)) v)
           (begin (vs-rec-miss-count-set! vs (+ (vs-rec-miss-count vs) 1)) #f))))
 
-  (define (value-store-has? vs hash-bv)
+  (def (value-store-has? vs hash-bv)
     (hashtable-contains? (vs-rec-table vs) hash-bv))
 
-  (define (value-store-close vs)
+  (def (value-store-close vs)
     ;; In-memory: nothing to close. Hook for LevelDB backend.
     (void))
 
-  (define (value-store-stats vs)
+  (def (value-store-stats vs)
     (list (cons 'entries    (hashtable-size (vs-rec-table vs)))
           (cons 'hits       (vs-rec-hit-count vs))
           (cons 'misses     (vs-rec-miss-count vs))

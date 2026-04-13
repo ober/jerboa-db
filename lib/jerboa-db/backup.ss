@@ -8,7 +8,16 @@
 (library (jerboa-db backup)
   (export backup! restore!)
 
-  (import (chezscheme)
+  (import (except (chezscheme)
+                  make-hash-table hash-table?
+                  sort sort!
+                  printf fprintf
+                  path-extension path-absolute?
+                  with-input-from-string with-output-to-string
+                  iota 1+ 1-
+                  partition
+                  make-date make-time)
+          (jerboa prelude)
           (jerboa-db datom)
           (jerboa-db schema)
           (jerboa-db index protocol)
@@ -18,17 +27,17 @@
 
   ;; ---- Magic header ----
   ;; First 8 bytes of every backup file.
-  (define +backup-magic+ #vu8(74 68 66 75 49 48 48 48))  ;; "JDBU1000"
+  (def +backup-magic+ #vu8(74 68 66 75 49 48 48 48))  ;; "JDBU1000"
 
   ;; ---- Lazy zlib loader ----
   ;; Mirrors the LevelDB lazy loader pattern in core.sls.
   ;; The backup format works with or without zlib:
   ;;   byte 8 = 1 → gzip compressed, 0 → uncompressed
-  (define zlib-loaded? #f)
-  (define zlib-gzip #f)
-  (define zlib-gunzip #f)
+  (def zlib-loaded? #f)
+  (def zlib-gzip #f)
+  (def zlib-gunzip #f)
 
-  (define (try-load-zlib!)
+  (def (try-load-zlib!)
     (unless zlib-loaded?
       (guard (exn [#t #f])
         (eval '(import (std compress zlib)))
@@ -39,7 +48,7 @@
   ;; ---- Schema serialization ----
   ;; Convert schema registry to a plain list for FASL portability.
 
-  (define (schema->plist schema)
+  (def (schema->plist schema)
     ;; Returns a list of (ident id vtype card unique index? comp? doc no-hist?)
     (map (lambda (attr)
            (list (db-attribute-ident attr)
@@ -53,7 +62,7 @@
                  (db-attribute-no-history? attr)))
          (schema-all-attributes schema)))
 
-  (define (plist->schema plist)
+  (def (plist->schema plist)
     ;; new-schema-registry bootstraps system attributes (IDs 0..19).
     ;; We then install user attributes from the plist on top of that.
     (let ([reg (new-schema-registry)])
@@ -83,7 +92,7 @@
   ;; FASL payload is a vector: #(basis-tx next-eid schema-plist datoms-list)
   ;; where datoms-list is a list of (e a v tx added?) 5-tuples.
 
-  (define (backup! conn output-path)
+  (def (backup! conn output-path)
     ;; Try to load zlib but proceed without it on failure
     (try-load-zlib!)
     (let* ([current-db (db conn)]
@@ -124,7 +133,7 @@
   ;; into the indices to avoid schema validation overhead and to preserve
   ;; original transaction IDs.
 
-  (define (restore! backup-path)
+  (def (restore! backup-path)
     (try-load-zlib!)
     ;; Read the file
     (let* ([in    (open-file-input-port backup-path

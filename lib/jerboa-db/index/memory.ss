@@ -8,7 +8,16 @@
 (library (jerboa-db index memory)
   (export make-mem-index-set)
 
-  (import (chezscheme)
+  (import (except (chezscheme)
+                  make-hash-table hash-table?
+                  sort sort!
+                  printf fprintf
+                  path-extension path-absolute?
+                  with-input-from-string with-output-to-string
+                  iota 1+ 1-
+                  partition
+                  make-date make-time)
+          (jerboa prelude)
           (jerboa-db datom)
           (jerboa-db index protocol))
 
@@ -19,16 +28,16 @@
   ;; RB-tree node: #f (empty) or (color left key value right)
   ;; color: 'R or 'B
 
-  (define (rb-empty) #f)
-  (define (rb-empty? t) (not t))
-  (define (rb-node color left key val right) (vector color left key val right))
-  (define (rb-color n) (vector-ref n 0))
-  (define (rb-left n)  (vector-ref n 1))
-  (define (rb-key n)   (vector-ref n 2))
-  (define (rb-val n)   (vector-ref n 3))
-  (define (rb-right n) (vector-ref n 4))
+  (def (rb-empty) #f)
+  (def (rb-empty? t) (not t))
+  (def (rb-node color left key val right) (vector color left key val right))
+  (def (rb-color n) (vector-ref n 0))
+  (def (rb-left n)  (vector-ref n 1))
+  (def (rb-key n)   (vector-ref n 2))
+  (def (rb-val n)   (vector-ref n 3))
+  (def (rb-right n) (vector-ref n 4))
 
-  (define (rb-balance color left key val right)
+  (def (rb-balance color left key val right)
     ;; Okasaki balance for red-black trees
     (cond
       ;; Case 1: left-left red
@@ -68,7 +77,7 @@
                      (rb-right (rb-right right))))]
       [else (rb-node color left key val right)]))
 
-  (define (rb-insert tree key val cmp)
+  (def (rb-insert tree key val cmp)
     (define (ins t)
       (if (rb-empty? t)
           (rb-node 'R (rb-empty) key val (rb-empty))
@@ -82,7 +91,7 @@
     (let ([r (ins tree)])
       (rb-node 'B (rb-left r) (rb-key r) (rb-val r) (rb-right r))))
 
-  (define (rb-delete tree key cmp)
+  (def (rb-delete tree key cmp)
     ;; Simplified delete — rebuild without the key
     ;; For Phase 1 correctness, this is O(n) but works reliably.
     (let ([pairs '()])
@@ -96,7 +105,7 @@
                    (rb-empty) filtered))))
 
   ;; In-order fold: (proc key value accumulator) -> accumulator
-  (define (rb-fold proc init tree)
+  (def (rb-fold proc init tree)
     (if (rb-empty? tree)
         init
         (let* ([left-result (rb-fold proc init (rb-left tree))]
@@ -104,7 +113,7 @@
           (rb-fold proc mid-result (rb-right tree)))))
 
   ;; Range fold: fold over keys in [lo, hi] (inclusive) by comparator
-  (define (rb-range-fold proc init tree lo hi cmp)
+  (def (rb-range-fold proc init tree lo hi cmp)
     (if (rb-empty? tree)
         init
         (let ([k (rb-key tree)]
@@ -123,16 +132,16 @@
               acc)))))
 
   ;; Collect all keys in-order
-  (define (rb-keys tree)
+  (def (rb-keys tree)
     (reverse (rb-fold (lambda (k v acc) (cons k acc)) '() tree)))
 
   ;; Count nodes
-  (define (rb-size tree)
+  (def (rb-size tree)
     (rb-fold (lambda (k v acc) (+ acc 1)) 0 tree))
 
   ;; ---- Memory index implementation ----
 
-  (define (make-mem-index name comparator)
+  (def (make-mem-index name comparator)
     (let ([tree-cell (list (rb-empty))])  ;; mutable cell
       (define (get-tree) (car tree-cell))
       (define (set-tree! t) (set-car! tree-cell t))
@@ -178,7 +187,7 @@
 
   ;; ---- Create the four covering indices ----
 
-  (define (make-mem-index-set)
+  (def (make-mem-index-set)
     (make-index-set
       (make-mem-index 'eavt compare-datoms-eavt)
       (make-mem-index 'aevt compare-datoms-aevt)

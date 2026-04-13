@@ -12,31 +12,40 @@
     tx-log-count tx-log-latest-tx
     tx-log-load-segments tx-log-segment-dir)
 
-  (import (chezscheme)
+  (import (except (chezscheme)
+                  make-hash-table hash-table?
+                  sort sort!
+                  printf fprintf
+                  path-extension path-absolute?
+                  with-input-from-string with-output-to-string
+                  iota 1+ 1-
+                  partition
+                  make-date make-time)
+          (jerboa prelude)
           (jerboa-db datom))
 
   ;; POSIX sync() — flushes all dirty kernel buffers to disk.
   ;; Ensures written segments survive power loss, not just process crash.
-  (define $os-sync (foreign-procedure "sync" () void))
+  (def $os-sync (foreign-procedure "sync" () void))
 
   ;; ---- Transaction log entry ----
 
-  (define-record-type tx-log-entry
-    (fields tx-id      ;; monotonic transaction ID
-            instant    ;; epoch seconds (integer)
-            datoms))   ;; list of datom field vectors: #(e a v tx added?)
+  (defstruct tx-log-entry
+    (tx-id      ;; monotonic transaction ID
+     instant    ;; epoch seconds (integer)
+     datoms))   ;; list of datom field vectors: #(e a v tx added?)
 
   ;; ---- Transaction log ----
   ;; In-memory: a simple reversed list of entries.
   ;; Persistent: segment files on disk.
 
-  (define-record-type tx-log
-    (fields (mutable entries)       ;; list of tx-log-entry (most recent first)
-            (mutable segment-dir)   ;; directory for segment files (or #f for in-memory)
-            (mutable segment-size)  ;; max entries per segment
-            (mutable current-segment-count))) ;; entries in current segment
+  (defstruct tx-log
+    (entries              ;; list of tx-log-entry (most recent first)
+     segment-dir          ;; directory for segment files (or #f for in-memory)
+     segment-size         ;; max entries per segment
+     current-segment-count)) ;; entries in current segment
 
-  (define (new-tx-log . opts)
+  (def (new-tx-log . opts)
     ;; Optional: (new-tx-log dir segment-size)
     (let ([dir (if (and (pair? opts) (string? (car opts))) (car opts) #f)]
           [seg-size (if (and (pair? opts) (pair? (cdr opts))) (cadr opts) 10000)])
@@ -44,7 +53,7 @@
 
   ;; ---- Append ----
 
-  (define (tx-log-append! log tx-id instant datoms)
+  (def (tx-log-append! log tx-id instant datoms)
     (let ([entry (make-tx-log-entry tx-id instant
                    (map datom->serializable datoms))])
       ;; Prepend to in-memory list
@@ -62,16 +71,16 @@
           (rotate-segment! log)))
       entry))
 
-  (define (datom->serializable d)
+  (def (datom->serializable d)
     (vector (datom-e d) (datom-a d) (datom-v d) (datom-tx d) (datom-added? d)))
 
-  (define (serializable->datom v)
+  (def (serializable->datom v)
     (make-datom (vector-ref v 0) (vector-ref v 1) (vector-ref v 2)
                 (vector-ref v 3) (vector-ref v 4)))
 
   ;; ---- Replay ----
 
-  (define (tx-log-replay log from-tx index-fn)
+  (def (tx-log-replay log from-tx index-fn)
     ;; Replay all entries from from-tx forward, calling index-fn for each datom.
     (let ([entries (reverse (tx-log-entries log))])
       (for-each
@@ -85,7 +94,7 @@
 
   ;; ---- Range query ----
 
-  (define (tx-log-range log start-tx end-tx)
+  (def (tx-log-range log start-tx end-tx)
     ;; Return entries in [start-tx, end-tx)
     (filter (lambda (e)
               (let ([tx (tx-log-entry-tx-id e)])
@@ -94,17 +103,17 @@
 
   ;; ---- Stats ----
 
-  (define (tx-log-count log)
+  (def (tx-log-count log)
     (length (tx-log-entries log)))
 
-  (define (tx-log-latest-tx log)
+  (def (tx-log-latest-tx log)
     (if (null? (tx-log-entries log))
         0
         (tx-log-entry-tx-id (car (tx-log-entries log)))))
 
   ;; ---- Segment file I/O ----
 
-  (define (write-entry-to-segment! log entry)
+  (def (write-entry-to-segment! log entry)
     (let* ([dir (tx-log-segment-dir log)]
            [segment-num (quotient (tx-log-count log)
                                    (tx-log-segment-size log))]
@@ -125,12 +134,12 @@
           port)
         (close-port port))))
 
-  (define (rotate-segment! log)
+  (def (rotate-segment! log)
     (tx-log-current-segment-count-set! log 0))
 
   ;; ---- Load from disk ----
 
-  (define (tx-log-load-segments dir)
+  (def (tx-log-load-segments dir)
     ;; Scan directory for segment files, read and merge
     (let ([log (new-tx-log dir 10000)])
       (when (file-exists? dir)
@@ -144,7 +153,7 @@
             files)))
       log))
 
-  (define (load-segment-file! log path)
+  (def (load-segment-file! log path)
     (let ([port (open-file-input-port path (file-options) (buffer-mode block) #f)])
       (let loop ()
         (guard (exn [else (void)])
@@ -159,7 +168,7 @@
                 (loop))))))
       (close-port port)))
 
-  (define (string-suffix? s suffix)
+  (def (string-suffix? s suffix)
     (let ([sl (string-length s)] [xl (string-length suffix)])
       (and (>= sl xl)
            (string=? (substring s (- sl xl) sl) suffix))))
