@@ -18,7 +18,8 @@
                   with-input-from-string with-output-to-string
                   iota 1+ 1-
                   partition
-                  make-date make-time)
+                  make-date make-time
+                atom? meta)
           (jerboa prelude)
           (jerboa-db schema))
 
@@ -123,7 +124,7 @@
           (let* ([scored (map (lambda (c)
                                 (cons (score-clause c bound-vars schema) c))
                               remaining)]
-                 [sorted (sort (lambda (a b) (> (car a) (car b))) scored)]
+                 [sorted (sort scored (lambda (a b) (> (car a) (car b))))]
                  [best (cdar sorted)]
                  [new-bound (clause-bound-vars best bound-vars)])
             (loop (remq best remaining)

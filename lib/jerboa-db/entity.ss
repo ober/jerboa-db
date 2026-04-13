@@ -17,7 +17,8 @@
                   with-input-from-string with-output-to-string
                   iota 1+ 1-
                   partition
-                  make-date make-time)
+                  make-date make-time
+                atom? meta)
           (jerboa prelude)
           (jerboa-db datom)
           (jerboa-db schema)

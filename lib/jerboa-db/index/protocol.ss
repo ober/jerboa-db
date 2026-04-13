@@ -23,21 +23,22 @@
                   with-input-from-string with-output-to-string
                   iota 1+ 1-
                   partition
-                  make-date make-time)
+                  make-date make-time
+                atom? meta)
           (jerboa prelude))
 
   ;; ---- Index interface (closure-based vtable) ----
   ;; Each field is a procedure implementing that operation.
 
-  (defstruct dbi
-    (name         ;; symbol: eavt, aevt, avet, vaet
-     add-fn       ;; (datom) -> void
-     remove-fn    ;; (datom) -> void
-     range-fn     ;; (start-datom end-datom) -> list of datoms
-     seek-fn      ;; (components) -> list of datoms
-     count-fn     ;; (start-datom end-datom) -> integer
-     snapshot-fn  ;; () -> opaque snapshot
-     datoms-fn))  ;; () -> list of all datoms
+  (define-record-type dbi
+    (fields name         ;; symbol: eavt, aevt, avet, vaet
+            add-fn       ;; (datom) -> void
+            remove-fn    ;; (datom) -> void
+            range-fn     ;; (start-datom end-datom) -> list of datoms
+            seek-fn      ;; (components) -> list of datoms
+            count-fn     ;; (start-datom end-datom) -> integer
+            snapshot-fn  ;; () -> opaque snapshot
+            datoms-fn))  ;; () -> list of all datoms
 
   ;; Dispatch wrappers
 
@@ -64,7 +65,7 @@
 
   ;; ---- Index set: the four covering indices ----
 
-  (defstruct index-set
-    (eavt aevt avet vaet))
+  (define-record-type index-set
+    (fields eavt aevt avet vaet))
 
 ) ;; end library

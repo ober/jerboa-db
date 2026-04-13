@@ -16,7 +16,8 @@
                   with-input-from-string with-output-to-string
                   iota 1+ 1-
                   partition
-                  make-date make-time)
+                  make-date make-time
+                atom? meta)
           (jerboa prelude)
           (jerboa-db datom)
           (jerboa-db schema)
@@ -58,11 +59,11 @@
   ;; Query format: ((find vars...) (in inputs...) (where clauses...))
   ;; All sections are identified by their car symbol.
 
-  (defstruct parsed-query
-    (find-vars    ;; list of symbols or (agg ?var) forms
-     in-vars      ;; list of input symbols ($ = db)
-     where-clauses ;; list of clause forms
-     rules))      ;; parsed rule definitions or #f
+  (define-record-type parsed-query
+    (fields find-vars      ;; list of symbols or (agg ?var) forms
+            in-vars        ;; list of input symbols ($ = db)
+            where-clauses  ;; list of clause forms
+            rules))
 
   (def (parse-query form)
     (let ([find-clause #f]
@@ -110,6 +111,25 @@
 
   ;; ---- Data pattern evaluation ----
   ;; A data pattern like (?e person/name ?name) is matched against an index.
+
+  ;; Try to unify a datom with the pattern, extending bindings.
+  ;; Returns extended bindings or #f if unification fails.
+  (def (try-unify-datom d e-spec a-spec v-spec tx-spec op-spec bindings)
+    (define (unify spec actual binds)
+      (cond
+        [(eq? spec '_) binds]  ;; wildcard
+        [(logic-var? spec)
+         (let ([existing (binding-ref binds spec)])
+           (if existing
+               (if (equal? existing actual) binds #f)  ;; already bound: must match
+               (binding-set binds spec actual)))]       ;; new binding
+        [(equal? spec actual) binds]                    ;; literal match
+        [else #f]))                                      ;; mismatch
+    (let* ([b1 (unify e-spec (datom-e d) bindings)]
+           [b2 (and b1 (unify v-spec (datom-v d) b1))]
+           [b3 (and b2 (unify tx-spec (datom-tx d) b2))]
+           [b4 (and b3 (unify op-spec (datom-added? d) b3))])
+      b4))
 
   (def (evaluate-data-pattern db pattern bindings schema)
     ;; pattern: (e-spec a-spec v-spec) or (e-spec a-spec v-spec tx-spec)
@@ -177,26 +197,7 @@
                                                       tx-spec op-spec bindings)])
                   (if new-bindings
                       (loop (cdr ds) (cons new-bindings results))
-                      (loop (cdr ds) results))))))))
-
-  ;; Try to unify a datom with the pattern, extending bindings.
-  ;; Returns extended bindings or #f if unification fails.
-  (def (try-unify-datom d e-spec a-spec v-spec tx-spec op-spec bindings)
-    (define (unify spec actual binds)
-      (cond
-        [(eq? spec '_) binds]  ;; wildcard
-        [(logic-var? spec)
-         (let ([existing (binding-ref binds spec)])
-           (if existing
-               (if (equal? existing actual) binds #f)  ;; already bound: must match
-               (binding-set binds spec actual)))]       ;; new binding
-        [(equal? spec actual) binds]                    ;; literal match
-        [else #f]))                                      ;; mismatch
-    (let* ([b1 (unify e-spec (datom-e d) bindings)]
-           [b2 (and b1 (unify v-spec (datom-v d) b1))]
-           [b3 (and b2 (unify tx-spec (datom-tx d) b2))]
-           [b4 (and b3 (unify op-spec (datom-added? d) b3))])
-      b4))
+                      (loop (cdr ds) results)))))))))
 
   ;; ---- Predicate clause evaluation ----
   ;; ((pred arg1 arg2 ...)) — returns filtered bindings

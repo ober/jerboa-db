@@ -22,7 +22,8 @@
                   with-input-from-string with-output-to-string
                   iota 1+ 1-
                   partition
-                  make-date make-time)
+                  make-date make-time
+                atom? meta)
           (jerboa prelude)
           (jerboa-db datom)
           (jerboa-db schema)
@@ -33,23 +34,23 @@
 
   ;; ---- Migration operation types ----
 
-  (defstruct migration
-    (operations))  ;; list of migration ops
+  (define-record-type migration
+    (fields operations))  ;; list of migration ops
 
-  (defstruct rename-op
-    (from-attr to-attr))
+  (define-record-type rename-op
+    (fields from-attr to-attr))
 
-  (defstruct add-index-op
-    (attr-ident))
+  (define-record-type add-index-op
+    (fields attr-ident))
 
-  (defstruct remove-index-op
-    (attr-ident))
+  (define-record-type remove-index-op
+    (fields attr-ident))
 
-  (defstruct merge-op
-    (from-attr into-attr merge-fn))
+  (define-record-type merge-op
+    (fields from-attr into-attr merge-fn))
 
-  (defstruct split-op
-    (from-attr into-a into-b split-fn))
+  (define-record-type split-op
+    (fields from-attr into-a into-b split-fn))
 
   ;; ---- Convenience constructors ----
 

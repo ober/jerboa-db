@@ -18,7 +18,8 @@
                   with-input-from-string with-output-to-string
                   iota 1+ 1-
                   partition
-                  make-date make-time)
+                  make-date make-time
+                atom? meta)
           (jerboa prelude)
           (jerboa-db datom)
           (jerboa-db schema))
@@ -170,10 +171,5 @@
               [(string=? (substring haystack i (+ i nlen)) needle) #t]
               [else (loop (+ i 1))])))))
 
-  (def (filter-map f lst)
-    (let loop ([lst lst] [acc '()])
-      (if (null? lst) (reverse acc)
-          (let ([r (f (car lst))])
-            (loop (cdr lst) (if r (cons r acc) acc))))))
 
 ) ;; end library

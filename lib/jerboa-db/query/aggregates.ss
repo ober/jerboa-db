@@ -17,7 +17,8 @@
                   with-input-from-string with-output-to-string
                   iota 1+ 1-
                   partition
-                  make-date make-time)
+                  make-date make-time
+                atom? meta)
           (jerboa prelude))
 
   ;; ---- Aggregate registry ----
@@ -84,7 +85,7 @@
   ;; median: middle value (sorts numerically)
   (register-aggregate! 'median
     (lambda (vs)
-      (let ([sorted (sort < (filter number? vs))])
+      (let ([sorted (sort (filter number? vs) <)])
         (if (null? sorted) #f
             (let ([n (length sorted)])
               (if (odd? n)

@@ -27,7 +27,8 @@
                   with-input-from-string with-output-to-string
                   iota 1+ 1-
                   partition
-                  make-date make-time)
+                  make-date make-time
+                atom? meta)
           (jerboa prelude))
 
   ;; ---- Sentinel values for range boundaries ----
@@ -35,7 +36,7 @@
   ;; +min-val+ compares less than any real value.
   ;; +max-val+ compares greater than any real value.
 
-  (defstruct sentinel (kind))
+  (define-record-type sentinel (fields kind))
   (def +min-val+ (make-sentinel 'min))
   (def +max-val+ (make-sentinel 'max))
 
@@ -44,13 +45,13 @@
 
   ;; ---- Datom record ----
 
-  (defstruct datom
-    (e       ;; entity id (integer)
-     a       ;; attribute id (integer, interned from keyword)
-     v       ;; value (scheme value — type depends on attribute schema)
-     tx      ;; transaction id (integer, monotonically increasing)
-     added?  ;; #t = assertion, #f = retraction
-     ))
+  (define-record-type datom
+    (fields e       ;; entity id (integer)
+            a       ;; attribute id (integer, interned from keyword)
+            v       ;; value (scheme value — type depends on attribute schema)
+            tx      ;; transaction id (integer, monotonically increasing)
+            added?  ;; #t = assertion, #f = retraction
+            ))
 
   ;; ---- Three-way comparison helpers ----
 

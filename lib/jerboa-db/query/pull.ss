@@ -15,7 +15,8 @@
                   with-input-from-string with-output-to-string
                   iota 1+ 1-
                   partition
-                  make-date make-time)
+                  make-date make-time
+                atom? meta)
           (jerboa prelude)
           (jerboa-db datom)
           (jerboa-db schema)
@@ -171,7 +172,7 @@
                      (list (cons out-key
                                  (if (and attr (cardinality-one? attr))
                                      (if (null? vals) (or default #f) (car vals))
-                                     vals))))]))))))
+                                     vals))))])))))))
 
   ;; ---- Reverse attributes ----
   ;; :person/_friends means "entities that reference me via :person/friends"
@@ -190,12 +191,6 @@
       (string->symbol
         (string-append (substring s 0 (+ slash-pos 1))
                        (substring s (+ slash-pos 2) (string-length s))))))
-
-  (def (string-index s ch)
-    (let loop ([i 0])
-      (cond [(>= i (string-length s)) #f]
-            [(char=? (string-ref s i) ch) i]
-            [else (loop (+ i 1))])))
 
   (def (pull-reverse-attr db attr-ident out-key grouped schema seen depth)
     ;; Find entities that reference the current entity via attr-ident

@@ -58,7 +58,8 @@
                   with-input-from-string with-output-to-string
                   iota 1+ 1-
                   partition
-                  make-date make-time)
+                  make-date make-time
+                atom? meta)
           (jerboa prelude)
           (std raft)
           (jerboa-db tx)
@@ -68,16 +69,16 @@
   ;; Configuration
   ;; =========================================================================
 
-  (defstruct replication-config
-    (node-id               ;; unique node identifier (symbol or integer)
-     cluster-nodes         ;; list of peer raft-node objects (in-process),
-                           ;; or #f for a standalone single-node deployment
-     data-path             ;; local data directory (informational / future use)
-     election-timeout-ms   ;; Raft election timeout hint (ms) — informational;
-                           ;; (std raft) manages its own 150–300 ms timeout
-     heartbeat-interval-ms ;; Raft heartbeat interval hint (ms) — informational;
-                           ;; (std raft) uses a 50 ms heartbeat internally
-     read-consistency))    ;; default: 'read-committed | 'read-latest | 'as-of
+  (define-record-type replication-config
+    (fields node-id               ;; unique node identifier (symbol or integer)
+            cluster-nodes         ;; list of peer raft-node objects (in-process),
+                                  ;; or #f for a standalone single-node deployment
+            data-path             ;; local data directory (informational / future use)
+            election-timeout-ms   ;; Raft election timeout hint (ms) — informational;
+                                  ;; (std raft) manages its own 150–300 ms timeout
+            heartbeat-interval-ms ;; Raft heartbeat interval hint (ms) — informational;
+                                  ;; (std raft) uses a 50 ms heartbeat internally
+            read-consistency))    ;; default: 'read-committed | 'read-latest | 'as-of
 
   ;; Convenience constructor: required args + optional tail for timeout / consistency.
   (def (new-replication-config node-id cluster-nodes data-path . opts)
@@ -95,11 +96,11 @@
   ;; Replication state
   ;; =========================================================================
 
-  (defstruct replication-state
-    (config                          ;; replication-config
-     raft-node                       ;; (std raft) node object
-     cluster                         ;; raft-cluster (or #f for standalone)
-     last-applied-index))            ;; highest Raft log index applied locally
+  (define-record-type replication-state
+    (fields config                                  ;; replication-config
+            raft-node                               ;; (std raft) node object
+            cluster                                 ;; raft-cluster (or #f for standalone)
+            (mutable last-applied-index)))          ;; highest Raft log index applied locally
 
   ;; =========================================================================
   ;; Lifecycle

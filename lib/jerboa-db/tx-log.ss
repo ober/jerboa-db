@@ -20,7 +20,8 @@
                   with-input-from-string with-output-to-string
                   iota 1+ 1-
                   partition
-                  make-date make-time)
+                  make-date make-time
+                atom? meta)
           (jerboa prelude)
           (jerboa-db datom))
 
@@ -30,20 +31,20 @@
 
   ;; ---- Transaction log entry ----
 
-  (defstruct tx-log-entry
-    (tx-id      ;; monotonic transaction ID
-     instant    ;; epoch seconds (integer)
-     datoms))   ;; list of datom field vectors: #(e a v tx added?)
+  (define-record-type tx-log-entry
+    (fields tx-id      ;; monotonic transaction ID
+            instant    ;; epoch seconds (integer)
+            datoms))   ;; list of datom field vectors: #(e a v tx added?)
 
   ;; ---- Transaction log ----
   ;; In-memory: a simple reversed list of entries.
   ;; Persistent: segment files on disk.
 
-  (defstruct tx-log
-    (entries              ;; list of tx-log-entry (most recent first)
-     segment-dir          ;; directory for segment files (or #f for in-memory)
-     segment-size         ;; max entries per segment
-     current-segment-count)) ;; entries in current segment
+  (define-record-type tx-log
+    (fields (mutable entries)              ;; list of tx-log-entry (most recent first)
+            segment-dir                    ;; directory for segment files (or #f for in-memory)
+            segment-size                   ;; max entries per segment
+            (mutable current-segment-count))) ;; entries in current segment
 
   (def (new-tx-log . opts)
     ;; Optional: (new-tx-log dir segment-size)
@@ -143,9 +144,9 @@
     ;; Scan directory for segment files, read and merge
     (let ([log (new-tx-log dir 10000)])
       (when (file-exists? dir)
-        (let ([files (sort string<?
-                       (filter (lambda (f) (string-suffix? f ".fasl"))
-                               (directory-list dir)))])
+        (let ([files (sort (filter (lambda (f) (string-suffix? f ".fasl"))
+                                   (directory-list dir))
+                           string<?)])
           (for-each
             (lambda (file)
               (let ([path (string-append dir "/" file)])

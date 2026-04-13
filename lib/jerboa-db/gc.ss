@@ -22,7 +22,8 @@
                   with-input-from-string with-output-to-string
                   iota 1+ 1-
                   partition
-                  make-date make-time)
+                  make-date make-time
+                atom? meta)
           (jerboa prelude)
           (jerboa-db datom)
           (jerboa-db schema)
@@ -67,7 +68,7 @@
                      [is-idx?  (and attr (indexed-attr? attr))])
                 (when (or no-hist? collect-all?)
                   ;; Find highest-tx datom
-                  (let* ([sorted (sort (lambda (a b) (> (datom-tx a) (datom-tx b))) datoms)]
+                  (let* ([sorted (sort datoms (lambda (a b) (> (datom-tx a) (datom-tx b))))]
                          [top    (car sorted)])
                     ;; GC only if the current state is retracted
                     (when (not (datom-added? top))
@@ -112,7 +113,7 @@
               (let* ([attr-id (cadr key)]
                      [attr    (schema-lookup-by-id schema attr-id)]
                      [no-hist? (and attr (db-attribute-no-history? attr))]
-                     [sorted (sort (lambda (a b) (> (datom-tx a) (datom-tx b))) datoms)]
+                     [sorted (sort datoms (lambda (a b) (> (datom-tx a) (datom-tx b))))]
                      [top    (car sorted)])
                 (when (and (not (datom-added? top)) (or no-hist? collect-all?))
                   (set! reclaimable (+ reclaimable (length datoms))))))

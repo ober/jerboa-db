@@ -43,31 +43,33 @@
                   with-input-from-string with-output-to-string
                   iota 1+ 1-
                   partition
-                  make-date make-time)
+                  make-date make-time
+                atom? meta)
           (jerboa prelude))
 
   ;; ---- Attribute record ----
 
-  (defstruct db-attribute
-    (ident          ;; symbol (e.g., person/name)
-     id             ;; integer (interned for index keys)
-     value-type     ;; symbol: db.type/string, db.type/long, etc.
-     cardinality    ;; symbol: db.cardinality/one or db.cardinality/many
-     unique         ;; #f, db.unique/value, or db.unique/identity
-     index?         ;; boolean — populate AVET?
-     is-component?  ;; boolean — cascade retractions?
-     doc            ;; string or #f
-     no-history?    ;; boolean — skip history?
-     tuple-attrs    ;; list of component attr ident symbols for composite, or #f
-     fulltext?))    ;; boolean — enable fulltext indexing
+  (define-record-type db-attribute
+    (fields ident          ;; symbol (e.g., person/name)
+            id             ;; integer (interned for index keys)
+            value-type     ;; symbol: db.type/string, db.type/long, etc.
+            cardinality    ;; symbol: db.cardinality/one or db.cardinality/many
+            unique         ;; #f, db.unique/value, or db.unique/identity
+            index?         ;; boolean — populate AVET?
+            is-component?  ;; boolean — cascade retractions?
+            doc            ;; string or #f
+            no-history?    ;; boolean — skip history?
+            tuple-attrs    ;; list of component attr ident symbols for composite, or #f
+            fulltext?))    ;; boolean — enable fulltext indexing
 
   ;; ---- Schema registry ----
   ;; Maps ident (symbol) <-> id (integer), and id -> db-attribute.
 
-  (defstruct schema-registry
-    (ident->id    ;; hashtable: symbol -> integer
-     id->attr     ;; hashtable: integer -> db-attribute
-     next-id))    ;; integer: next attribute ID to assign
+  (define-record-type schema-registry
+    (fields ident->id          ;; hashtable: symbol -> integer
+            id->attr           ;; hashtable: integer -> db-attribute
+            (mutable next-id)  ;; integer: next attribute ID to assign
+            ))
 
   ;; The raw constructor from defstruct is make-schema-registry.
   ;; We wrap it to add bootstrapping.
