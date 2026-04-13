@@ -62,6 +62,30 @@
         (binding-ref bindings x)
         x))
 
+  ;; ---- Projection helpers (projection pushdown) ----
+  ;; Strip dead variables from bindings after each clause to reduce allocation.
+
+  (def (project-bindings bindings live-vars n-live)
+    ;; Return a hashtable containing only keys in live-vars.
+    ;; Fast path: if count matches, bindings are already minimal — return as-is.
+    ;; Uses hashtable-size (O(1)) instead of hashtable-keys (allocates vector).
+    (if (= (hashtable-size bindings) n-live)
+        bindings   ;; fast path: already minimal, no allocation
+        (let ([new-ht (make-hashtable symbol-hash eq?)])
+          (for-each (lambda (v)
+                      (let ([val (hashtable-ref bindings v #f)])
+                        (when val (hashtable-set! new-ht v val))))
+                    live-vars)
+          new-ht)))
+
+  (def (project-bindings-list bindings-list live-vars)
+    ;; Project every binding in the list to live-vars.
+    ;; Skip entirely if nothing to project (n-live = 0 or list is empty).
+    (let ([n-live (length live-vars)])
+      (if (= n-live 0)
+          bindings-list
+          (map (lambda (b) (project-bindings b live-vars n-live)) bindings-list))))
+
   ;; ---- Query parsing ----
   ;; Query format: ((find vars...) (in inputs...) (where clauses...))
   ;; All sections are identified by their car symbol.
@@ -355,75 +379,105 @@
 
   ;; ---- Main query evaluation ----
 
-  (def (evaluate-where-clauses db clauses bindings-list schema rules-ht)
-    (if (null? clauses)
-        bindings-list
-        (let* ([clause   (car clauses)]
-               [rest     (cdr clauses)]
-               ;; Range-predicate pushdown: fuse (?e attr ?v) [(cmp ?v const)] into
-               ;; a single AVET range scan.  pushdown = (bounds . new-rest) or (#f . rest).
-               ;; ONLY fires when both entity AND value are unbound — if entity is bound,
-               ;; EAVT point-lookup (one datom) is always faster than an AVET range scan.
-               [pushdown
-                 (if (and (data-pattern? clause)
-                          (pair? rest)
-                          (predicate-clause? (car rest)))
-                     (let* ([e-spec (car clause)]
-                            [v-spec (and (>= (length clause) 3) (caddr clause))]
-                            [a-spec (cadr clause)]
-                            [attr   (schema-lookup-by-ident schema a-spec)])
-                       (if (and (logic-var? v-spec)
-                                attr
-                                (avet-eligible? attr)
-                                (pair? bindings-list)
-                                (not (binding-ref (car bindings-list) v-spec))
-                                ;; Entity must be unbound; if bound, EAVT is faster
-                                (logic-var? e-spec)
-                                (not (binding-ref (car bindings-list) e-spec)))
-                           (let* ([;; Resolve bound logic-vars (e.g. input params) so
-                                   ;; ((> ?v ?input)) pushes down even when ?input is a
-                                   ;; bound logic-var rather than a literal constant.
-                                   resolved-pred1
-                                     (if (pair? bindings-list)
-                                         (resolve-pred-form-against (car bindings-list) (caar rest))
-                                         (caar rest))]
-                                  [b1 (parse-range-predicate resolved-pred1 v-spec)]
-                                  ;; Absorb a second consecutive range predicate too
-                                  [b2 (and b1
-                                           (pair? (cdr rest))
-                                           (predicate-clause? (cadr rest))
-                                           (let ([resolved-pred2
-                                                   (if (pair? bindings-list)
-                                                       (resolve-pred-form-against (car bindings-list) (caadr rest))
-                                                       (caadr rest))])
-                                             (parse-range-predicate resolved-pred2 v-spec)))]
-                                  [bounds (and b1 (merge-range-bounds b1 b2))]
-                                  [skip-n (if b2 2 (if b1 1 0))])
-                             (if bounds
-                                 (cons bounds (list-tail rest skip-n))
-                                 (cons #f rest)))
-                           (cons #f rest)))
-                     (cons #f rest))]
-               [bounds    (car pushdown)]
-               [eval-rest (cdr pushdown)]
-               ;; Inline flatmap: avoids building an intermediate list-of-lists.
-               ;; Early termination: if no bindings survive a clause, stop immediately.
-               [new-bindings-list
-                 (let loop ([lst bindings-list] [acc '()])
-                   (if (null? lst)
-                       (reverse acc)
-                       (let inner ([rs (if bounds
-                                           (evaluate-data-pattern-in-range
-                                            db clause (car lst) schema bounds)
-                                           (evaluate-single-clause
-                                            db clause (car lst) schema rules-ht))]
-                                   [a acc])
-                         (if (null? rs)
-                             (loop (cdr lst) a)
-                             (inner (cdr rs) (cons (car rs) a))))))])
-          (if (null? new-bindings-list)
-              '()
-              (evaluate-where-clauses db eval-rest new-bindings-list schema rules-ht)))))
+  ;; evaluate-where-clauses: main recursive engine.
+  ;; live-vars-steps: a list of (N+1) symbol lists from compute-live-vars-at-each-step,
+  ;;   or #f to disable projection (used by rule/not/or sub-evaluations).
+  ;; Element i = vars that must be live BEFORE clause[i]; last element = find-used-vars.
+  ;; After evaluating clause[i] we project to live-vars-steps[i+1] (cadr live-vars-steps).
+  (def (evaluate-where-clauses db clauses bindings-list schema rules-ht . rest-args)
+    (let ([live-vars-steps (if (null? rest-args) #f (car rest-args))])
+      (if (null? clauses)
+          bindings-list
+          (let* ([clause   (car clauses)]
+                 [rest     (cdr clauses)]
+                 ;; Range-predicate pushdown: fuse (?e attr ?v) [(cmp ?v const)] into
+                 ;; a single AVET range scan.  pushdown = (bounds . new-rest) or (#f . rest).
+                 ;; ONLY fires when both entity AND value are unbound — if entity is bound,
+                 ;; EAVT point-lookup (one datom) is always faster than an AVET range scan.
+                 [pushdown
+                   (if (and (data-pattern? clause)
+                            (pair? rest)
+                            (predicate-clause? (car rest)))
+                       (let* ([e-spec (car clause)]
+                              [v-spec (and (>= (length clause) 3) (caddr clause))]
+                              [a-spec (cadr clause)]
+                              [attr   (schema-lookup-by-ident schema a-spec)])
+                         (if (and (logic-var? v-spec)
+                                  attr
+                                  (avet-eligible? attr)
+                                  (pair? bindings-list)
+                                  (not (binding-ref (car bindings-list) v-spec))
+                                  ;; Entity must be unbound; if bound, EAVT is faster
+                                  (logic-var? e-spec)
+                                  (not (binding-ref (car bindings-list) e-spec)))
+                             (let* ([;; Resolve bound logic-vars (e.g. input params) so
+                                     ;; ((> ?v ?input)) pushes down even when ?input is a
+                                     ;; bound logic-var rather than a literal constant.
+                                     resolved-pred1
+                                       (if (pair? bindings-list)
+                                           (resolve-pred-form-against (car bindings-list) (caar rest))
+                                           (caar rest))]
+                                    [b1 (parse-range-predicate resolved-pred1 v-spec)]
+                                    ;; Absorb a second consecutive range predicate too
+                                    [b2 (and b1
+                                             (pair? (cdr rest))
+                                             (predicate-clause? (cadr rest))
+                                             (let ([resolved-pred2
+                                                     (if (pair? bindings-list)
+                                                         (resolve-pred-form-against (car bindings-list) (caadr rest))
+                                                         (caadr rest))])
+                                               (parse-range-predicate resolved-pred2 v-spec)))]
+                                    [bounds (and b1 (merge-range-bounds b1 b2))]
+                                    [skip-n (if b2 2 (if b1 1 0))])
+                               (if bounds
+                                   (cons bounds (list-tail rest skip-n))
+                                   (cons #f rest)))
+                             (cons #f rest)))
+                       (cons #f rest))]
+                 [bounds    (car pushdown)]
+                 [eval-rest (cdr pushdown)]
+                 ;; Inline flatmap: avoids building an intermediate list-of-lists.
+                 ;; Early termination: if no bindings survive a clause, stop immediately.
+                 [new-bindings-list
+                   (let loop ([lst bindings-list] [acc '()])
+                     (if (null? lst)
+                         (reverse acc)
+                         (let inner ([rs (if bounds
+                                             (evaluate-data-pattern-in-range
+                                              db clause (car lst) schema bounds)
+                                             (evaluate-single-clause
+                                              db clause (car lst) schema rules-ht))]
+                                     [a acc])
+                           (if (null? rs)
+                               (loop (cdr lst) a)
+                               (inner (cdr rs) (cons (car rs) a))))))])
+            (if (null? new-bindings-list)
+                '()
+                ;; Projection pushdown: strip dead variables before recursing.
+                ;; live-vars-steps[0] = live before clause[0]
+                ;; live-vars-steps[1] = live after clause[0] (= before clause[1]) — project to this.
+                ;; The range-predicate pushdown may have consumed extra clauses, so the
+                ;; number of steps consumed may be > 1. We advance live-vars-steps by the
+                ;; same number of clauses consumed (1 + number of fused predicates).
+                (let* ([steps-consumed
+                         (if (not live-vars-steps) 0
+                             (- (+ 1 (length clauses))
+                                (+ 1 (length eval-rest))))]
+                       [next-steps
+                         (and live-vars-steps
+                              (list-tail live-vars-steps steps-consumed))]
+                       [live-after
+                         (and next-steps (pair? next-steps) (car next-steps))]
+                       ;; live-before = live-vars-steps[0] — vars that were live before clause[0].
+                       ;; If live-after has the same count as live-before, no variables went dead
+                       ;; and we can skip projection entirely (avoid map over bindings-list).
+                       [live-before (and live-vars-steps (car live-vars-steps))]
+                       [projected
+                         (if (and live-after live-before
+                                  (< (length live-after) (length live-before)))
+                             (project-bindings-list new-bindings-list live-after)
+                             new-bindings-list)])
+                  (evaluate-where-clauses db eval-rest projected schema rules-ht next-steps)))))))
 
   (def (evaluate-single-clause db clause bindings schema rules-ht)
     (cond
@@ -749,10 +803,13 @@
            [bound-at-start (if (null? input-bindings) '()
                                (vector->list (hashtable-keys (car input-bindings))))]
            [ordered-clauses (reorder-clauses where-clauses bound-at-start schema)]
+           ;; Compute live variable sets for projection pushdown
+           [live-vars-steps (compute-live-vars-at-each-step ordered-clauses find-vars)]
            ;; Execute
            [result-bindings
              (evaluate-where-clauses db ordered-clauses
-                                     input-bindings schema rules-from-input)])
+                                     input-bindings schema rules-from-input
+                                     live-vars-steps)])
       (extract-find-results find-vars result-bindings)))
 
   ;; Helper: find position of element in list

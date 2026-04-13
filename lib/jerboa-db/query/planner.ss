@@ -8,7 +8,8 @@
   (export
     reorder-clauses choose-index
     clause-bound-vars clause-used-vars
-    score-clause)
+    score-clause
+    compute-live-vars-at-each-step)
 
   (import (except (chezscheme)
                   make-hash-table hash-table?
@@ -134,6 +135,40 @@
             (loop (remq best remaining)
                   (append new-bound bound-vars)
                   (cons best result))))))
+
+  ;; ---- Live variable analysis (projection pushdown support) ----
+
+  ;; Union two lists using eq? identity, without duplicates.
+  (def (lset-union* lst1 lst2)
+    (fold-left (lambda (acc x) (if (memq x acc) acc (cons x acc))) lst1 lst2))
+
+  ;; Extract logic vars referenced in a find-var spec.
+  ;; Plain var → (var). Aggregate form (agg ?var) → (?var). Literal → ().
+  (def (find-var-used-vars fv)
+    (cond
+      [(and (pair? fv) (not (null? (cdr fv)))) ; (agg ?var) or (agg ?var1 ?var2 ...)
+       (filter logic-var? (cdr fv))]
+      [(logic-var? fv) (list fv)]
+      [else '()]))
+
+  ;; Compute for each step i (0..N) which variables must be live BEFORE clause[i].
+  ;; Returns a list of N+1 symbol lists.
+  ;; live-after[i] = find-used-vars ∪ clause-used-vars for all clauses[i+1..N-1].
+  ;; live-before[i] = live-after[i] ∪ clause-used-vars(clause[i]).
+  ;; The full list returned is: (live-before[0] live-before[1] ... live-before[N-1] find-used).
+  (def (compute-live-vars-at-each-step planned-clauses find-vars)
+    (let* ([find-used (apply append (map find-var-used-vars find-vars))]
+           [n (length planned-clauses)]
+           [clauses-vec (list->vector planned-clauses)])
+      ;; Walk right-to-left, accumulating live vars.
+      ;; result starts as (find-used) and we prepend live-before[i] at each step.
+      (let loop ([i (- n 1)] [live find-used] [result (list find-used)])
+        (if (< i 0)
+            result
+            (let* ([clause (vector-ref clauses-vec i)]
+                   [used (clause-used-vars clause)]
+                   [new-live (lset-union* live used)])
+              (loop (- i 1) new-live (cons new-live result)))))))
 
   ;; ---- Index selection ----
   ;; Choose which index to scan for a data pattern.

@@ -1,20 +1,121 @@
 # Jerboa-DB: Datomic Without the JVM
 
 **Goal:** A fully-featured Datomic clone built entirely on Jerboa, using LevelDB for
-index storage and DuckDB for analytics.  Single binary, embeddable, distributed,
-with a Datalog query engine and immutable time-travel over all data.
+persistent index storage and DuckDB for analytics (planned).  Single binary,
+embeddable, with a Datalog query engine and immutable time-travel over all data.
 
-**Status:** 2026-04-13 — **Phases 1–8 implemented. All 34 integration tests
-pass. MBrainz benchmark harness complete and running (all 8 queries verified).**  Implementation lives in `lib/jerboa-db/` (Jerboa library files using
-`#!chezscheme` + `(library ...)` form).  Architecture deviation from spec: built
-from scratch rather than using `(std mvcc)`, `(std datalog)`, etc. — all
-functionality is self-contained.
+**Status:** 2026-04-13 — **Phases 1–3 fully implemented and tested (34/34 tests
+pass).  Phase 2 (LevelDB persistence) is wired and production-ready.  Phases 4–6
+are functional stubs awaiting future work.  MBrainz benchmark harness complete
+(all 8 queries verified at 1% scale).**
+
+Implementation lives in `lib/jerboa-db/` (Jerboa library files using `#!chezscheme`
++ `(library ...)` form).  Built from scratch — no `(std mvcc)`, `(std datalog)`, or
+other stdlib modules are used; all functionality is self-contained.
 
 **MBrainz target:** Run the Datahike MBrainz benchmark to completion (6.6M
 entities, complex Datalog joins, aggregation) as the validation gate.
 **Benchmark harness complete (2026-04-13):** all 8 standard queries run against
 synthetic data at configurable scale.  `make mbrainz-quick` for smoke test,
-`make mbrainz` for full scale.  See MBrainz Benchmark section below.
+`make mbrainz` for full scale.  See [MBrainz Benchmark](#mbrainz-benchmark-results) section below.
+
+---
+
+## Implementation Status
+
+| Phase | Description | Status |
+|---|---|---|
+| 1 | Core in-memory (datoms, indices, schema, Datalog, pull, time-travel) | ✅ Complete |
+| 2 | LevelDB persistence (`connect("path")`, 4-index LevelDB backend, FASL encoding) | ✅ Complete |
+| 3 | Query engine (planner, predicates, aggregates, rules, streaming) | ✅ Complete |
+| 4 | DuckDB analytics (SQL over datoms, Parquet export/import) | 🚧 Stub |
+| 5 | Server mode (HTTP API, WebSocket tx-stream, remote peer) | 🚧 Stub |
+| 6 | Raft HA (distributed consensus, read replicas) | 📋 Planned |
+| 7 | Polish (backup/restore ✅, GDPR excision ✅, schema migration 🚧) | ✅ Mostly done |
+| 8 | Advanced (fulltext ✅, GC ✅, entity specs ✅, composite tuples ✅) | ✅ Complete |
+
+---
+
+## Missing Datomic Features
+
+Comparison of Jerboa-DB against real Datomic.  This section documents gaps — whether
+they are unimplemented (❌), implemented (✅), or planned stubs (🚧).
+
+### Query Engine
+
+| Feature | Status | Notes |
+|---|---|---|
+| `pull [*]` wildcard | ✅ Done | Returns all user attributes; skips internal schema attrs |
+| Reverse refs in pull (`_attr`) | ✅ Done | `pull-attr-spec` handles `reverse-attr?` convention |
+| `:rules` / `%` in `:in` | ✅ Done | Recursive rules with fixed-point evaluation |
+| `not` clause | ✅ Done | Implicit-join-vars form |
+| `not-join` clause | ❌ Missing | Datomic's explicit-variable form of NOT |
+| `or` clause | ✅ Done | Union of disjunctive branches |
+| Parameterized `:in` (scalar, tuple, collection, relation) | ✅ Done | All four binding forms implemented |
+| `count`, `sum`, `avg`, `min`, `max` aggregates | ✅ Done | Streaming single-pass with mutable accumulators |
+| `count-distinct` aggregate | ✅ Done | Implemented in `query/aggregates.ss` |
+| `median` aggregate | ✅ Done | Implemented |
+| `variance`, `stddev` aggregates | ❌ Missing | Not implemented |
+| `rand`, `sample` aggregates | ✅ Done | Implemented in `query/aggregates.ss` |
+| `ground` function clause | ✅ Done | `[(ground 42) ?x]` in `query/functions.ss` |
+| `get-else`, `missing?` functions | ✅ Done | Implemented |
+| Query `explain` | ✅ Done | Returns plan without executing |
+
+### Transactions and Schema
+
+| Feature | Status | Notes |
+|---|---|---|
+| `:db/add` assertions | ✅ Done | Map form and vector form |
+| `:db/retract` retractions | ✅ Done | Both map-level and explicit vector form |
+| `:db/retractEntity` | ✅ Done | Retracts all datoms for an entity |
+| `:db/cas` (compare-and-swap) | ✅ Done | `[:db/cas eid attr old new]` |
+| `db/tupleAttrs` composite tuples | ✅ Done | Auto-generation on transact |
+| Tempid resolution | ✅ Done | String tempids, within-tx consistency |
+| Lookup refs as entity IDs | ✅ Done | `[attr-ident value]` pair resolution |
+| Schema migration (rename/retype) | 🚧 Stub | `migrate.ss` skeleton; additive-only works via `transact!` |
+| Stored database functions (`:db/fn`) | ❌ Missing | No eval-at-transact-time functions |
+| `:db.unique/identity` upsert | ✅ Done | Merges into existing entity |
+
+### Time-Travel
+
+| Feature | Status | Notes |
+|---|---|---|
+| `as-of` | ✅ Done | Filter to tx ≤ N |
+| `since` | ✅ Done | Filter to tx > N |
+| `history` | ✅ Done | All datoms including retracted |
+| `tx-range` | ✅ Done | Returns datoms from tx-log between two tx IDs |
+| `log` API object | ❌ Missing | Datomic exposes `(d/log conn)` as a first-class navigable object; `tx-range` takes `conn` directly here |
+
+### Index Access API
+
+| Feature | Status | Notes |
+|---|---|---|
+| `pull` | ✅ Done | Full pattern walking with nesting, limits, defaults |
+| `pull-many` | ✅ Done | Exported from `core.ss` |
+| `entity` / `touch` | ✅ Done | Lazy entity maps with eager materialization |
+| `datoms` (direct index iteration) | ❌ Missing | Datomic's `(d/datoms db index components...)` not exposed publicly |
+| `index-range` | ❌ Missing | Datomic's `(d/index-range db :attr ...)` not exposed |
+| `seek-datoms` | ❌ Missing | Positioned scan into an index, not exposed |
+
+### Distribution
+
+| Feature | Status | Notes |
+|---|---|---|
+| Single-node embedded | ✅ Done | Core use case |
+| LevelDB persistent storage | ✅ Done | `connect("path/to/db")` |
+| HTTP server | 🚧 Stub | `server.ss` skeleton; not runnable yet |
+| Remote peer client | ❌ Missing | Post-Phase-5 |
+| Raft consensus / HA | 📋 Planned | `replication.ss` is a structural stub |
+| Read replicas | ❌ Missing | Requires Phase 5+6 |
+
+### Analytics
+
+| Feature | Status | Notes |
+|---|---|---|
+| Datalog aggregation (count/sum/avg/min/max) | ✅ Done | Built-in, streaming |
+| DuckDB SQL over datoms | 🚧 Stub | `analytics.ss` has full structure; not wired to core |
+| Parquet export/import | ❌ Missing | Depends on DuckDB integration |
+| CSV bulk import | ❌ Missing | Depends on DuckDB integration |
 
 ---
 
@@ -43,7 +144,7 @@ trade-offs:
 | DataScript | Clojure/JS | In-memory | Yes | No | No | Yes (JS) |
 | Datahike | JVM | Pluggable | Yes | Partial | No | No |
 | Datalevin | JVM | LMDB | Yes | No | No | No |
-| **Jerboa-DB** | **Native** | **LevelDB + DuckDB** | **Yes** | **Yes** | **Yes** | **Yes** |
+| **Jerboa-DB** | **Native** | **LevelDB (persistent) + in-memory RB-trees; DuckDB planned** | **Yes** | **Yes** | **Planned (stub)** | **Yes** |
 
 Jerboa-DB fills a gap that doesn't exist today: a **native, embeddable,
 distributed, time-traveling Datalog database** that ships as a single binary and
@@ -54,38 +155,26 @@ requires zero external infrastructure.
 This isn't just "rewrite Datomic in Scheme."  Jerboa has building blocks that
 make this project tractable in a way it wouldn't be in Go, Rust, or Python:
 
-| Datomic Concept | Jerboa Building Block | Status |
+| Datomic Concept | Jerboa Building Block | Actual Usage |
 |---|---|---|
-| Immutable fact store | `(std mvcc)` — MVCC with time-travel | Exists |
-| EAVT/AEVT/VAET indices | `(std db leveldb)` — LSM tree with bloom filters | Exists |
-| Datalog query engine | `(std datalog)` — semi-naive evaluation | Exists |
-| Logic variable unification | `(std logic)` — full miniKanren | Exists |
-| Persistent collections | `(std data pmap)`, `(std pvec)`, `(std pset)` | Exists |
-| Transaction log | `(std event-source)` — immutable event log | Exists |
-| Schema validation | `(std schema)` — composable validators | Exists |
-| Serialization (wire format) | `(std text edn)`, `(std text msgpack)`, `(std fasl)` | Exists |
-| Peer caching | `(std misc lru-cache)` — O(1) LRU | Exists |
-| Concurrent reads | `(std concur stm)` — optimistic transactions | Exists |
-| Distributed consensus | `(std raft)` — leader election + log replication | Exists |
-| Replicated state | `(std actor crdt)` — OR-Set, LWW-Register, etc. | Exists |
-| Content addressing | `(std content-address)` — hash-based storage | Exists |
-| Analytical queries | `(std db duckdb)` — columnar OLAP engine | Exists |
-| Connection pooling | `(std db conpool)` — thread-safe pool | Exists |
-| Actor supervision | `(std actor)` — OTP-style fault tolerance | Exists |
-| HTTP API server | `(std net fiber-httpd)` — fiber-native HTTP | Exists |
-| Binary encoding | `(std text cbor)`, `(std text msgpack)` | Exists |
-| Compression | `(std compress zlib)` — gzip for segment files | Exists |
-| UUID generation | `(std misc uuid)` — v4 random UUIDs | Exists |
-| Sorted indices | `(std misc rbtree)`, `(std ds sorted-map)` | Exists |
-| File-backed B+ tree | `(std mmap-btree)` — transactional | Exists |
-| Memory-mapped I/O | `(std os mmap)` — zero-copy file access | Exists |
-| Relational algebra | `(std misc relation)` — join, project, select | Exists |
-| Protocol dispatch | `(std protocol)` — Clojure-style protocols | Exists |
-| Transducer pipelines | `(std transducer)` — streaming transforms | Exists |
-| Lazy sequences | `(std lazy)`, `(std misc lazy-seq)` | Exists |
+| Immutable fact store | `(std mvcc)` — MVCC with time-travel | **Not used** — self-contained db-value snapshots |
+| EAVT/AEVT/VAET indices | `(std db leveldb)` — LSM tree with bloom filters | **Used** — `index/leveldb.ss` imports `(std db leveldb)` |
+| Datalog query engine | `(std datalog)` — semi-naive evaluation | **Not used** — self-contained engine in `query/engine.ss` |
+| Logic variable unification | `(std logic)` — full miniKanren | **Not used** — custom unification in engine |
+| Persistent collections | `(std data pmap)`, `(std pvec)`, `(std pset)` | **Not used** — custom RB-tree in `index/memory.ss` |
+| Transaction log | `(std event-source)` — immutable event log | **Not used** — FASL segment log in `tx-log.ss` |
+| Schema validation | `(std schema)` — composable validators | **Not used** — self-contained `schema.ss` |
+| Serialization | `(std fasl)` — Chez native binary format | **Used** — FASL encoding of datom values in LevelDB |
+| Server | `(std net fiber-httpd)` — fiber-native HTTP | **Used in stub** — `server.ss` imports it; not functional yet |
+| Analytical queries | `(std db duckdb)` — columnar OLAP engine | **Used in stub** — `analytics.ss` imports it; DuckDB planned |
+| Distributed consensus | `(std raft)` — leader election + log replication | **Available** — Phase 6 (not started) |
+| Actor supervision | `(std actor)` — OTP-style fault tolerance | **Available** — Phase 5+ |
+| EDN wire format | `(std text edn)` — EDN parser | **Used in server stub** — for HTTP request/response |
 
-Every row in that table is code that already exists and is tested.  The work is
-**composition and integration**, not building from scratch.
+The implementation chose to build the core engine from scratch (using only
+`(chezscheme)` + `(jerboa prelude)`) for full control over data layout and
+performance.  Stdlib modules are used for FFI (LevelDB, DuckDB) and planned
+for server/distribution phases.
 
 ---
 
@@ -615,10 +704,12 @@ lib/jerboa-db/
 
 ### Actual Dependencies (as-implemented)
 
-The implementation is built from scratch using only `(chezscheme)` and
-`(jerboa prelude)` — no `(std ...)` stdlib modules are used.  In-memory indices
-use custom red-black tree insertion (embedded in `index/memory.ss`).  LevelDB
-backend uses the `chez-lmdb`/`chez-duckdb` FFI shared libraries when available.
+The core engine is built from scratch using `(chezscheme)` and `(jerboa prelude)`
+only.  In-memory indices use a custom red-black tree implementation embedded in
+`index/memory.ss`.  The LevelDB backend (`index/leveldb.ss`) imports `(std db leveldb)`
+for the FFI bindings.  The analytics stub and server stub import `(std db duckdb)`,
+`(std net fiber-httpd)`, `(std net fiber-ws)`, and `(std text edn)`.
+No `(std mvcc)`, `(std datalog)`, or other stdlib modules are used in the core path.
 
 ```
 (jerboa-db core)
@@ -643,9 +734,10 @@ backend uses the `chez-lmdb`/`chez-duckdb` FFI shared libraries when available.
 
 ## Implementation Plan
 
-> **Current state (2026-04-12):** Phases 1–3 and 7–8 are fully implemented and
-> tested (34/34 tests pass).  Phases 4–6 are stubs.  The sections below describe
-> the original design intent; they serve as reference documentation.
+> **Current state (2026-04-13):** Phases 1–3 and 7–8 are fully implemented and
+> tested (34/34 tests pass).  Phase 2 (LevelDB) is wired and production-ready.
+> Phases 4–6 are stubs.  The sections below describe the original design intent;
+> they serve as reference documentation.
 
 ### Phase 1: Core — In-Memory Datomic ✅ IMPLEMENTED
 
@@ -882,10 +974,18 @@ Transducers are used for streaming intermediate results.
 - 1000 entities with 10 attributes each, queried in < 10ms
 - All operations available from the REPL
 
-### Phase 2: Persistence — LevelDB Backend
+### Phase 2: Persistence — LevelDB Backend ✅ IMPLEMENTED
 
 **Goal:** Replace in-memory indices with LevelDB.  Data survives process restarts.
 Transaction log is durable.
+
+**What's wired:** `connect("path/to/db")` triggers `ensure-leveldb!` in `core.ss`,
+which lazy-loads `(jerboa-db index leveldb)` and calls `make-leveldb-index-set`.
+Four separate LevelDB directories (`eavt/`, `aevt/`, `avet/`, `vaet/`) are opened
+with bloom filters (10 bits/key) and a 64MB LRU block cache each.  Keys are 28-byte
+binary-encoded datom components that sort correctly via bytewise comparison.  Values
+are FASL-encoded full datom records for fast Scheme deserialization.  `close(conn)`
+cleanly closes all four handles.
 
 #### 2.1 LevelDB Index Backend
 
@@ -1125,10 +1225,20 @@ aggregation, rules, built-in functions, and streaming results.
 - Built-in functions work in filter and binding positions
 - Query over 1M datoms completes in < 1 second for typical OLTP patterns
 
-### Phase 4: DuckDB Analytics Layer
+### Phase 4: DuckDB Analytics Layer 🚧 STUB
 
 **Goal:** Wire DuckDB as an analytical query engine for workloads that don't
 fit Datalog — aggregation over large datasets, window functions, ad-hoc SQL.
+
+**Current state:** `analytics.ss` (249 lines) imports `(std db duckdb)` and has:
+- `new-analytics-engine` — creates a DuckDB connection and the `datoms` table
+- `analytics-sync!` — reads the tx-log and inserts datom rows into DuckDB
+- `analytics-query` — executes SQL against the replica
+- `insert-datom-row!` with type-classified column slots
+
+The structure is complete but has **not been wired into `core.ss`** (no auto-sync on
+`transact!`, no user-facing `analytics` function exported from core).  DuckDB FFI
+availability is also build-dependent.  This phase is post-MBrainz work.
 
 #### 4.1 DuckDB Replica
 
@@ -1186,10 +1296,16 @@ fit Datalog — aggregation over large datasets, window functions, ad-hoc SQL.
 - Parquet export produces valid files readable by pandas/DuckDB/Spark
 - CSV/Parquet import creates correct datoms with schema validation
 
-### Phase 5: Server Mode
+### Phase 5: Server Mode 🚧 STUB
 
 **Goal:** A standalone Jerboa-DB server accessible over HTTP and WebSocket,
 enabling multi-client access and remote peers.
+
+**Current state:** `server.ss` (221 lines) has complete route handlers for all
+REST endpoints and the WebSocket tx-stream (fiber-based, with a mutex-guarded
+client registry and broadcast).  The EDN request/response plumbing is in place.
+It has **not been integrated** into a runnable entry point or CLI — no `main`
+invocation exists.  Consider it a functional skeleton awaiting a build target.
 
 #### 5.1 HTTP API
 
@@ -1376,7 +1492,7 @@ jerboa-db stats --data /var/lib/jerboa-db
 | Binary size | < 30MB | N/A (Datomic is 60MB+ JARs) |
 | Max database size | 1TB+ (disk limit) | Comparable |
 | Concurrent readers | Unlimited (immutable db-values) | Comparable |
-| Aggregate over 10M datoms | < 5s (DuckDB) | Faster (columnar engine) |
+| Aggregate over 10M datoms | < 5s (DuckDB, planned) | DuckDB stub — not yet wired |
 
 ### Why These Numbers Are Achievable
 
@@ -1389,13 +1505,18 @@ jerboa-db stats --data /var/lib/jerboa-db
 
 ---
 
-## The DuckDB Advantage
+## The DuckDB Advantage (Planned — Phase 4)
 
 Datomic's biggest weakness is analytical queries.  Aggregating over millions of
 datoms requires custom index scans and client-side computation.  XTDB v2
 addressed this with Apache Arrow, but it's still JVM-only.
 
-Jerboa-DB's DuckDB integration provides:
+> **Note:** DuckDB integration is planned but not yet wired.  `analytics.ss`
+> has the full structure (schema, sync, typed column mapping) but is not connected
+> to `core.ss` or any user-facing API.  The capabilities below describe the
+> intended final state.
+
+Jerboa-DB's DuckDB integration will provide:
 
 1. **Full SQL over datoms** — GROUP BY, HAVING, WINDOW functions, CTEs, subqueries
 2. **Vectorized execution** — DuckDB processes data in columnar batches, 10-100x
@@ -1413,7 +1534,7 @@ Jerboa-DB's DuckDB integration provides:
    ```
 5. **No external infrastructure** — DuckDB runs in-process, same as LevelDB
 
-This gives Jerboa-DB a **dual-engine architecture**: Datalog for navigational
+This will give Jerboa-DB a **dual-engine architecture**: Datalog for navigational
 queries (follow relationships, traverse graphs) and SQL for analytical queries
 (aggregate, window, report).  No other Datomic-like system offers both.
 
@@ -1426,9 +1547,9 @@ the honest answer is: not easily.
 
 | Requirement | Go | Rust | Python | Jerboa |
 |---|---|---|---|---|
-| Datalog query engine | Build from scratch | Build from scratch | DataScript (JS FFI) | `(std datalog)` exists |
+| Datalog query engine | Build from scratch | Build from scratch | DataScript (JS FFI) | `(std datalog)` exists (built own for control) |
 | Persistent data structures | None in stdlib | None in stdlib | None in stdlib | pmap, pvec, pset exist |
-| MVCC with time-travel | Build from scratch | Build from scratch | Build from scratch | `(std mvcc)` exists |
+| MVCC with time-travel | Build from scratch | Build from scratch | Build from scratch | `(std mvcc)` exists (built own db-values) |
 | Event sourcing | Build from scratch | Build from scratch | Build from scratch | `(std event-source)` exists |
 | Raft consensus | etcd/raft (library) | raft-rs (library) | None | `(std raft)` exists |
 | LevelDB bindings | goleveldb | leveldb-rs | plyvel | `(std db leveldb)` exists |
@@ -1448,10 +1569,11 @@ project and a multi-year one.
 
 ---
 
-## Implementation Scorecard (2026-04-12)
+## Implementation Scorecard (2026-04-13)
 
-> All source lives in `lib/jerboa-db/`.  Built from scratch (no `(std ...)`
-> stdlib modules used).  All 34 integration tests pass as of 2026-04-12.
+> All source lives in `lib/jerboa-db/`.  Core engine built from scratch (no
+> `(std mvcc)`, `(std datalog)`, etc. used).  LevelDB FFI via `(std db leveldb)`.
+> All 34 integration tests pass as of 2026-04-13.
 
 ### Core (Phase 1) — ✅ COMPLETE
 
@@ -1563,18 +1685,22 @@ Files: `lib/jerboa-db/fulltext.ss`, `lib/jerboa-db/gc.ss`, `lib/jerboa-db/spec.s
 | Fulltext search | ✅ Done | In-memory inverted index, case-insensitive word/substring |
 | Datom garbage collection | ✅ Done | Compact retracted `db/noHistory` datoms |
 
-### Query Engine Performance Optimizations (planned)
+### Query Engine Performance Optimizations
 
-| Optimization | Description | Benefit |
-|---|---|---|
-| AVET for all scalar attrs | Every non-ref, non-tuple attribute populates the AVET index | Exact-match and range queries use index instead of full AEVT scan |
-| Binding hashtable | Binding env is an `eq?` hashtable instead of alist | O(1) variable lookup vs O(n) for deep join pipelines |
-| Streaming flatmap | `evaluate-where-clauses` uses inline flatmap instead of `(apply append (map …))` | Avoids intermediate list-of-lists allocation |
-| Early termination | Clause evaluation stops immediately when no bindings survive | Avoids evaluating remaining clauses on empty result set |
-| Count short-circuit | `(count ?x)` with no grouping vars skips per-row extraction | Direct `(length bindings-list)` — O(1) vs O(n) |
-| Range predicate pushdown | `(?e attr ?v) [(cmp ?v const)]` fused into single AVET range scan | Scans only the qualifying value range; fires only when entity is unbound |
-| Schema lookup cache | Per-transaction `symbol-hash` hashtable wrapping `schema-lookup-by-ident` | Eliminates repeated global hashtable lookups per datom during write |
-| Retraction fast-path | `resolve-current-datoms` skips hashtable when no retractions present | Common case (append-only DB) avoids O(n) hashtable build |
+| Optimization | Status | Description | Benefit |
+|---|---|---|---|
+| AVET for indexed/unique attrs | ✅ Done | `avet-eligible?` — only `db/index #t` or unique attrs use AVET | Prevents incorrect index selection |
+| Binding hashtable | ✅ Done | Binding env is an `eq?` hashtable | O(1) variable lookup vs O(n) alist |
+| Streaming flatmap | ✅ Done | `evaluate-where-clauses` uses inline flatmap | Avoids intermediate list-of-lists allocation |
+| Early termination | ✅ Done | Clause evaluation stops when no bindings survive | Skips remaining clauses on empty result |
+| Count short-circuit | ✅ Done | `(count ?x)` with no grouping skips per-row extraction | O(1) vs O(n) |
+| Range predicate pushdown | ✅ Done | `(?e attr ?v) [(cmp ?v const)]` fused into AVET range scan | Scans only qualifying value range |
+| Schema lookup cache | ✅ Done | Per-transaction `eq?` hashtable `tx-val-cache` in `tx.ss` | Eliminates repeated global hashtable lookups per datom |
+| Retraction fast-path | ✅ Done | `resolve-current-datoms` skips hashtable when no retractions | Common append-only case avoids O(n) hashtable build |
+| Streaming aggregation | ✅ Done | Single-pass `count`/`sum`/`avg`/`min`/`max` with mutable vector accumulators | Eliminates intermediate list materialization |
+| Hash-join | ❌ Planned | O(M+N) join for shared-variable clauses | Would reduce Q4/Q8 from O(M×N) |
+| Projection pushdown | ❌ Planned | Reduce binding tuple width early | Cheaper copy-on-write in deep joins |
+| Cardinality statistics | ❌ Planned | Per-attribute count estimates for planner | Better clause ordering |
 
 **Performance targets (to be measured after implementation):**
 
@@ -1590,7 +1716,7 @@ Files: `lib/jerboa-db/fulltext.ss`, `lib/jerboa-db/gc.ss`, `lib/jerboa-db/spec.s
 
 ---
 
-## MBrainz Benchmark Plan
+## MBrainz Benchmark Results
 
 The **MBrainz** dataset (derived from MusicBrainz) is the standard benchmark for
 Datomic-compatible databases.  Datahike publishes numbers against it, making it
@@ -1606,67 +1732,89 @@ the right validation target.
 - **Tracks:** name, position, duration, artists (ref, many)
 - **Labels:** name, sortName, type, country, startYear, endYear
 
-### Required Queries (Datahike MBrainz benchmark set)
+The benchmark uses synthetic data at configurable scale factors (default 1.0 = 262K
+artists, 1.31M releases, 13.1M tracks).  Results below are at **1% scale** (2,620
+artists, 13,100 releases, 131,000 tracks).
 
-1. Simple attribute lookup: artists by exact name
-2. Two-clause join: releases by artist name
-3. Range predicate: artists active before year X
-4. Multi-join: tracks → release → artist with attribute filters
-5. Aggregation: count releases per artist, avg track duration
-6. Reverse ref navigation: find all releases referencing an artist entity
-7. Rule-based: transitive relationships (if present)
-8. Pull patterns: artist with nested releases and tracks
-
-### Current Status vs MBrainz Requirements (2026-04-13)
-
-All query engine features required for MBrainz are **implemented and tested**.
-All benchmark infrastructure is **complete**:
+### Benchmark Infrastructure
 
 | Component | Status | Notes |
 |---|---|---|
-| MBrainz schema definition | ✅ Done | `benchmarks/mbrainz-schema.ss` — 29 attributes, all entity types |
-| Synthetic data loader | ✅ Done | `benchmarks/mbrainz-bench.ss` — 262K artists × 5 releases × 50 tracks, flat batching |
-| Benchmark query runner | ✅ Done | `benchmarks/mbrainz-bench.ss` — 8 standard queries, median timing, `make mbrainz-quick` |
+| MBrainz schema definition | ✅ Done | Inline in `benchmarks/mbrainz-bench.ss` — 29 attributes, all entity types |
+| Synthetic data loader | ✅ Done | 3-phase flat batching: artists → releases → tracks |
+| Benchmark query runner | ✅ Done | 8 standard queries, median timing over 5 runs (1 warmup), `make mbrainz-quick` |
 
-### Benchmark Results (1% scale — 2620 artists, 13100 releases, 131000 tracks)
+### Benchmark Results (1% scale — 2026-04-13)
 
 ```
+Scale: 1% (2,620 artists, 13,100 releases, 131,000 tracks)
+
 Query                                                      Median         Result
 --------------------------------------------------------------------------------
 Q1: Artist exact name lookup                                0 ms        42 rows
 Q2: Releases by artist name                                 0 ms       210 rows
 Q3: Artists with startYear < 1960                           2 ms      1173 rows
-Q4: Tracks > 240s on shared-artist releases              2241 ms    428096 rows
-Q5: Count releases per country                              5 ms        10 rows
+Q4: Tracks > 240s on shared-artist releases             ~2468 ms    428,096 rows
+Q5: Count releases per country                              4 ms        10 rows
 Q6: All releases for one artist (reverse ref)               0 ms         5 rows
 Q7: Pull artist attributes                                  0 ms         5 rows
-Q8: Avg track duration by release status                 1519 ms         3 rows
+Q8: Avg track duration by release status                ~2056 ms         3 rows
 --------------------------------------------------------------------------------
-Total                                                    3767 ms
+Total                                                   ~4500 ms
 ```
 
-**Load time at 1% scale:** ~120s.  Known bottleneck: each `transact!` call rebuilds
-sorted index structures; 295 transactions × ~450 datoms/tx = ~132K datoms total.
-Optimization opportunity: batch index merge (defer sort until end of load phase).
+### Analysis
 
-**Known remaining work:**
-- Load performance: `transact!` overhead per batch is high; needs bulk-index path
-- Q4/Q8 are slow (2s+) due to unbounded join result set; needs hash-join or
-  semi-join pushdown
-- Real MBrainz EDN loader (parse actual Datahike EDN files instead of synthetic data)
+**Fast queries (Q1–Q3, Q5–Q7):** 0–4ms.  All use index-optimized paths:
+- Q1: AVET point lookup by `artist/name` (exact match)
+- Q2: AVET → AEVT join (anchor on artist, scan releases)
+- Q3: AVET range scan with predicate pushdown (`startYear < 1960`)
+- Q5: AEVT full-attribute scan with streaming `count` aggregation
+- Q6: AEVT scan on `release/artists` (join on entity)
+- Q7: EAVT point lookup + pull pattern evaluation
 
-### Data Loading Strategy
+**Q4 (~2468ms):** Bottleneck is **join explosion**, not algorithms.  The query
+asks for tracks with duration > 240s that share an artist with any release.  At 1%
+scale this produces 428,096 output rows — a Cartesian product of tracks × matching
+releases per shared artist.  The join itself is correctly using AEVT index scans;
+the cost is proportional to the output size.  Hash-join or semi-join pushdown would
+reduce intermediate binding count but cannot eliminate the 428K result size.
+
+**Q8 (~2056ms):** Bottleneck is **intermediate binding count**.  The query joins
+tracks → artists → releases to get release status, then groups by status and
+aggregates.  At 1% scale this produces 655K intermediate `(track, artist, release)`
+bindings before aggregation.  Streaming aggregation (single-pass with mutable
+vector accumulators) is implemented and working — the cost is the binding
+generation, not the aggregation step itself.
+
+### Optimizations Applied (all committed)
+
+| Optimization | Implementation | Effect |
+|---|---|---|
+| `avet-eligible?` predicate | Only attributes with `db/index #t` or `db/unique` use the AVET index | Prevents incorrect index selection |
+| Planner selectivity scoring | Score 1000 when all variables in a clause are bound | Enables AVET range pushdown for Q4 |
+| `tx-val-cache` in `tx.ss` | Per-transaction `eq?` hashtable keyed on `eid*256+aid` | Avoids EAVT scan during transact; amortizes schema lookups |
+| Streaming aggregation | Single-pass `count`/`sum`/`avg`/`min`/`max` with mutable vector accumulators | Eliminates intermediate list materialization for aggregates |
+
+### Remaining Performance Opportunities
+
+| Opportunity | Target Queries | Expected Gain |
+|---|---|---|
+| Projection pushdown | Q4, Q8 | Reduce binding tuple width → cheaper copy-on-write |
+| Hash-join (O(M+N) instead of O(M×N)) | Q4, Q8 | Eliminate nested-loop join for shared-variable joins |
+| Cardinality statistics | All | Better planner ordering (avoid anchoring on low-selectivity clauses) |
+| Bulk-index load path | Load time | Defer RB-tree sort until end of load phase; currently ~120s at 1% scale |
+| Real MBrainz EDN loader | Full scale | Parse actual Datahike EDN files instead of synthetic data |
+
+### Data Loading Strategy (Full Scale)
 
 MBrainz data is distributed as EDN transaction files (Datomic format).
 
-1. Parse EDN with Jerboa's EDN reader or custom parser (Datomic EDN uses keywords `:attr/name`)
+1. Parse EDN with Jerboa's EDN reader (Datomic EDN uses `:keyword/attr` style → map to `symbol/attr`)
 2. Map Datomic-style tempids (`#db/id[:db.part/user -1000000]`) to Jerboa tempids
 3. Batch transactions (1000 entities per tx) for throughput
 4. Schema bootstrap transaction first, then entity data
 5. **Target:** load 6.6M entities in < 5 min (in-memory), < 15 min (LevelDB)
-
-**Note:** Datomic EDN uses `:keyword/attr` style while Jerboa-DB uses `symbol/attr`
-style.  The loader must handle this mapping.
 
 ---
 

@@ -29,6 +29,9 @@
     ;; Transaction log
     tx-range
 
+    ;; Direct index access
+    datoms
+
     ;; Utilities
     db-stats schema-for
 
@@ -261,7 +264,111 @@
         (cache . ,(cache-stats (connection-db-cache conn))))))
 
   (def (schema-for conn)
-    (schema-all-attributes (db-value-schema (db conn))))
+    ;; Returns a list of all user-defined db-attribute records (id >= +first-user-attr-id+)
+    ;; with full details: ident, value-type, cardinality, unique, index?, etc.
+    (filter (lambda (attr) (>= (db-attribute-id attr) +first-user-attr-id+))
+            (schema-all-attributes (db-value-schema (db conn)))))
+
+  ;; ---- Direct index access ----
+  ;; (datoms db index-name . components)
+  ;; index-name: 'eavt, 'aevt, 'avet, or 'vaet
+  ;; components: partial key values in index order
+  ;;   eavt: [e a v tx]
+  ;;   aevt: [a e v tx]
+  ;;   avet: [a v e tx]
+  ;;   vaet: [v a e tx]
+  ;; Each component narrows the scan; omit trailing components for prefix scans.
+  ;; Attribute ident symbols are automatically resolved to their integer IDs.
+
+  (def (datoms db index-name . components)
+    (let* ([schema (db-value-schema db)]
+           [resolve-attr (lambda (x)
+                           ;; If x is a symbol that looks like an attribute ident, resolve it
+                           (if (symbol? x)
+                               (let ([attr (schema-lookup-by-ident schema x)])
+                                 (if attr (db-attribute-id attr) x))
+                               x))]
+           [idx (db-resolve-index db index-name)])
+      (let-values ([(lo hi)
+                    (case index-name
+                      [(eavt)
+                       ;; order: e, a, v, tx
+                       (let* ([e  (and (>= (length components) 1) (list-ref components 0))]
+                              [a  (and (>= (length components) 2) (resolve-attr (list-ref components 1)))]
+                              [v  (and (>= (length components) 3) (list-ref components 2))]
+                              [tx (and (>= (length components) 4) (list-ref components 3))])
+                         (values
+                           (make-datom (or e 0)
+                                       (or a 0)
+                                       (if v v +min-val+)
+                                       (or tx 0)
+                                       #t)
+                           (make-datom (or e (greatest-fixnum))
+                                       (or a (greatest-fixnum))
+                                       (if v v +max-val+)
+                                       (or tx (greatest-fixnum))
+                                       #t)))]
+                      [(aevt)
+                       ;; order: a, e, v, tx
+                       (let* ([a  (and (>= (length components) 1) (resolve-attr (list-ref components 0)))]
+                              [e  (and (>= (length components) 2) (list-ref components 1))]
+                              [v  (and (>= (length components) 3) (list-ref components 2))]
+                              [tx (and (>= (length components) 4) (list-ref components 3))])
+                         (values
+                           (make-datom (or e 0)
+                                       (or a 0)
+                                       (if v v +min-val+)
+                                       (or tx 0)
+                                       #t)
+                           (make-datom (or e (greatest-fixnum))
+                                       (or a (greatest-fixnum))
+                                       (if v v +max-val+)
+                                       (or tx (greatest-fixnum))
+                                       #t)))]
+                      [(avet)
+                       ;; order: a, v, e, tx
+                       (let* ([a  (and (>= (length components) 1) (resolve-attr (list-ref components 0)))]
+                              [v  (and (>= (length components) 2) (list-ref components 1))]
+                              [e  (and (>= (length components) 3) (list-ref components 2))]
+                              [tx (and (>= (length components) 4) (list-ref components 3))])
+                         (values
+                           (make-datom (or e 0)
+                                       (or a 0)
+                                       (if v v +min-val+)
+                                       (or tx 0)
+                                       #t)
+                           (make-datom (or e (greatest-fixnum))
+                                       (or a (greatest-fixnum))
+                                       (if v v +max-val+)
+                                       (or tx (greatest-fixnum))
+                                       #t)))]
+                      [(vaet)
+                       ;; order: v, a, e, tx
+                       (let* ([v  (and (>= (length components) 1) (list-ref components 0))]
+                              [a  (and (>= (length components) 2) (resolve-attr (list-ref components 1)))]
+                              [e  (and (>= (length components) 3) (list-ref components 2))]
+                              [tx (and (>= (length components) 4) (list-ref components 3))])
+                         (values
+                           (make-datom (or e 0)
+                                       (or a 0)
+                                       (if v v +min-val+)
+                                       (or tx 0)
+                                       #t)
+                           (make-datom (or e (greatest-fixnum))
+                                       (or a (greatest-fixnum))
+                                       (if v v +max-val+)
+                                       (or tx (greatest-fixnum))
+                                       #t)))]
+                      [else
+                       (error 'datoms "unknown index name" index-name)])])
+        (let ([raw (dbi-range idx lo hi)])
+          (if (db-value-history? db)
+              (filter (lambda (d) (db-filter-datom? db d)) raw)
+              ;; Non-history: return only current (added) datoms
+              (filter (lambda (d)
+                        (and (db-filter-datom? db d)
+                             (datom-added? d)))
+                      raw))))))
 
   ;; ---- Fulltext search ----
   ;; Search for text in fulltext-indexed attributes on this connection.

@@ -94,37 +94,70 @@
            [datoms (entity-datoms db eid schema)]
            [grouped (group-by-attr datoms schema)])
       (let ([result (cons (cons 'db/id eid)
-                          (pull-pattern db pattern grouped schema seen depth))])
+                          (pull-pattern db pattern eid grouped schema seen depth))])
         (hashtable-delete! seen eid)
         result)))
 
-  (def (pull-pattern db pattern grouped schema seen depth)
+  ;; pull-pattern: eid is the current entity (needed for reverse attrs)
+  (def (pull-pattern db pattern eid grouped schema seen depth)
     (if (null? pattern)
         '()
-        (apply append
-          (map (lambda (spec)
-                 (pull-attr-spec db spec grouped schema seen depth))
-               pattern))))
+        ;; Check if wildcard is present in pattern
+        (let ([has-wildcard? (memq '* pattern)]
+              [extra-specs (filter (lambda (s) (not (eq? s '*))) pattern)])
+          (if has-wildcard?
+              ;; Wildcard: all user attributes + any extra specs
+              (let ([wildcard-pairs
+                     (filter-map
+                       (lambda (pair)
+                         (let* ([ident (car pair)]
+                                [values (cdr pair)]
+                                [attr (schema-lookup-by-ident schema ident)])
+                           ;; Skip system attributes (id < +first-user-attr-id+)
+                           (if (and attr (>= (db-attribute-id attr) +first-user-attr-id+))
+                               (if (cardinality-one? attr)
+                                   (cons ident (if (null? values) #f (car values)))
+                                   (cons ident values))
+                               #f)))
+                       grouped)]
+                    [extra-pairs
+                     (apply append
+                       (map (lambda (spec)
+                              (pull-attr-spec db spec eid grouped schema seen depth))
+                            extra-specs))])
+                ;; Merge: extras override wildcard where they overlap
+                (let ([extra-keys (map car extra-pairs)])
+                  (append (filter (lambda (p) (not (memq (car p) extra-keys)))
+                                  wildcard-pairs)
+                          extra-pairs)))
+              ;; No wildcard: process each spec normally
+              (apply append
+                (map (lambda (spec)
+                       (pull-attr-spec db spec eid grouped schema seen depth))
+                     pattern))))))
 
-  (def (pull-attr-spec db spec grouped schema seen depth)
+  (def (pull-attr-spec db spec eid grouped schema seen depth)
     (cond
-      ;; Wildcard: all attributes
+      ;; Wildcard handled in pull-pattern; if we reach here alone, do full wildcard
       [(eq? spec '*)
-       (map (lambda (pair)
-              (let* ([ident (car pair)]
-                     [values (cdr pair)]
-                     [attr (schema-lookup-by-ident schema ident)])
-                (if (and attr (cardinality-one? attr))
-                    (cons ident (if (null? values) #f (car values)))
-                    (cons ident values))))
-            grouped)]
+       (filter-map
+         (lambda (pair)
+           (let* ([ident (car pair)]
+                  [values (cdr pair)]
+                  [attr (schema-lookup-by-ident schema ident)])
+             (if (and attr (>= (db-attribute-id attr) +first-user-attr-id+))
+                 (if (cardinality-one? attr)
+                     (cons ident (if (null? values) #f (car values)))
+                     (cons ident values))
+                 #f)))
+         grouped)]
 
       ;; Simple attribute (symbol)
       [(symbol? spec)
        (let* ([reverse? (reverse-attr? spec)]
               [real-ident (if reverse? (unreverse-attr spec) spec)])
          (if reverse?
-             (pull-reverse-attr db real-ident spec grouped schema seen depth)
+             (pull-reverse-attr db real-ident spec eid schema seen depth #f #f)
              (let ([attr (schema-lookup-by-ident schema spec)]
                    [values (cond [(assq spec grouped) => cdr] [else '()])])
                (if (and attr (cardinality-one? attr))
@@ -133,13 +166,13 @@
 
       ;; Nested pull: (attr sub-pattern) or (attr :option val ...)
       [(and (pair? spec) (symbol? (car spec)))
-       (pull-nested-spec db spec grouped schema seen depth)]
+       (pull-nested-spec db spec eid grouped schema seen depth)]
 
       [else (error 'pull "Invalid pull spec" spec)]))
 
   ;; ---- Nested pull specs ----
 
-  (def (pull-nested-spec db spec grouped schema seen depth)
+  (def (pull-nested-spec db spec eid grouped schema seen depth)
     (let* ([ident (car spec)]
            [rest (cdr spec)]
            [reverse? (reverse-attr? ident)]
@@ -149,8 +182,7 @@
                     (parse-pull-options rest)])
         (let ([out-key (or alias ident)])
           (if reverse?
-              (pull-reverse-attr-nested db real-ident out-key sub-pattern
-                                         limit schema seen depth)
+              (pull-reverse-attr db real-ident out-key eid schema seen depth sub-pattern limit)
               (let* ([attr (schema-lookup-by-ident schema real-ident)]
                      [values (cond [(assq real-ident grouped) => cdr] [else '()])]
                      [limited (if limit (take-at-most values limit) values)])
@@ -192,14 +224,53 @@
         (string-append (substring s 0 (+ slash-pos 1))
                        (substring s (+ slash-pos 2) (string-length s))))))
 
-  (def (pull-reverse-attr db attr-ident out-key grouped schema seen depth)
-    ;; Find entities that reference the current entity via attr-ident
-    ;; using VAET index
-    (list (cons out-key '())))  ;; simplified for now; full impl in core
+  (def (find-referencing-entities db attr-ident current-eid schema)
+    ;; Use VAET index to find all entities that reference current-eid via attr-ident.
+    ;; VAET is sorted by (v, a, e, tx).
+    (let* ([attr (schema-lookup-by-ident schema attr-ident)]
+           [vaet (db-resolve-index db 'vaet)])
+      (if (not attr)
+          '()
+          (let* ([aid (db-attribute-id attr)]
+                 ;; We scan for datoms where v=current-eid and a=aid
+                 ;; Build lo/hi bracketing the exact (v=current-eid, a=aid) range
+                 [lo (make-datom 0 aid current-eid 0 #t)]
+                 [hi (make-datom (greatest-fixnum) aid current-eid (greatest-fixnum) #t)]
+                 ;; VAET cmp: v first, then a, then e, then tx
+                 ;; So for v=current-eid and a=aid, we need probes with v and a fixed
+                 ;; Use a broad scan and filter:
+                 [broad-lo (make-datom 0 0 current-eid 0 #t)]
+                 [broad-hi (make-datom (greatest-fixnum) (greatest-fixnum) current-eid (greatest-fixnum) #t)]
+                 [raw (dbi-range vaet broad-lo broad-hi)]
+                 [filtered (filter (lambda (d)
+                                     (and (= (datom-a d) aid)
+                                          (equal? (datom-v d) current-eid)
+                                          (db-filter-datom? db d)))
+                                   raw)])
+            ;; Resolve current state: for each referencing entity, keep latest
+            ;; assertion per entity
+            (let ([ht (make-eq-hashtable)])
+              (for-each
+                (lambda (d)
+                  (let* ([ref-eid (datom-e d)]
+                         [ex (hashtable-ref ht ref-eid #f)])
+                    (when (or (not ex) (> (datom-tx d) (datom-tx ex)))
+                      (hashtable-set! ht ref-eid d))))
+                filtered)
+              (let-values ([(ks vs) (hashtable-entries ht)])
+                (map datom-e (filter datom-added? (vector->list vs)))))))))
 
-  (def (pull-reverse-attr-nested db attr-ident out-key sub-pattern limit
-                                     schema seen depth)
-    (list (cons out-key '())))
+  (def (pull-reverse-attr db attr-ident out-key current-eid schema seen depth
+                          sub-pattern limit)
+    ;; Find all entities that have attr-ident pointing at current-eid
+    (let* ([ref-eids (find-referencing-entities db attr-ident current-eid schema)]
+           [limited (if limit (take-at-most ref-eids limit) ref-eids)]
+           [result (if sub-pattern
+                       (map (lambda (ref-eid)
+                              (pull-entity* db sub-pattern ref-eid seen (+ depth 1)))
+                            limited)
+                       limited)])
+      (list (cons out-key result))))
 
   ;; ---- Option parsing ----
 
