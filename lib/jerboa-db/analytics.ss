@@ -3,6 +3,18 @@
 ;;;
 ;;; Maintains a columnar replica of the datom store for analytical queries.
 ;;; Provides SQL over datoms, Parquet export/import, and CSV import.
+;;;
+;;; Usage:
+;;;   (def ae (new-analytics-engine schema-reg index-set))
+;;;   (analytics-sync! ae db-value)          ;; load/refresh from db snapshot
+;;;   (analytics-query ae "SELECT ...")       ;; returns list of alists
+;;;   (export-parquet ae "/tmp/out.parquet")
+;;;   (analytics-close ae)
+;;;
+;;; The engine exposes two tables in DuckDB:
+;;;   datoms(e, a, a_name, v_long, v_double, v_string, v_bool,
+;;;          v_ref, v_instant, tx, added)
+;;;   attrs(id, ident, value_type, cardinality)
 
 (library (jerboa-db analytics)
   (export
@@ -25,83 +37,116 @@
           (std db duckdb)
           (jerboa-db datom)
           (jerboa-db schema)
-          (jerboa-db tx-log))
+          (jerboa-db history)
+          (jerboa-db index protocol))
 
   ;; ---- Analytics engine record ----
 
   (defstruct analytics-engine
     (duckdb-conn     ;; DuckDB connection handle (integer)
-     last-synced-tx  ;; last tx synced to DuckDB
-     schema-ref      ;; reference to schema registry
-     tx-log-ref))    ;; reference to transaction log
+     last-synced-tx  ;; last tx whose datoms have been loaded (integer)
+     schema-ref      ;; schema-registry reference
+     synced?))       ;; boolean: has initial sync been done?
 
-  (def (new-analytics-engine schema tx-log . opts)
-    ;; Optional: path for persistent DuckDB file
-    (let ([path (if (pair? opts) (car opts) ":memory:")])
-      (let ([conn (duckdb-open path)])
-        (let ([ae (make-analytics-engine conn 0 schema tx-log)])
-          (create-datom-table! ae)
-          ae))))
+  ;; ---- Constructor ----
+
+  (def (new-analytics-engine schema . opts)
+    ;; Optional: path for persistent DuckDB file (default: in-memory)
+    (let* ([path (if (pair? opts) (car opts) ":memory:")]
+           [conn (duckdb-open path)]
+           [ae   (make-analytics-engine conn 0 schema #f)])
+      (create-tables! ae)
+      ae))
 
   ;; ---- Schema setup ----
 
-  (def (create-datom-table! ae)
-    (duckdb-exec (analytics-engine-duckdb-conn ae)
-      "CREATE TABLE IF NOT EXISTS datoms (
-         e       BIGINT   NOT NULL,
-         a       INTEGER  NOT NULL,
-         a_name  VARCHAR,
-         v_long    BIGINT,
-         v_double  DOUBLE,
-         v_string  VARCHAR,
-         v_bool    BOOLEAN,
-         v_ref     BIGINT,
-         v_instant BIGINT,
-         tx      BIGINT   NOT NULL,
-         added   BOOLEAN  NOT NULL
-       )"))
+  (def (create-tables! ae)
+    (let ([conn (analytics-engine-duckdb-conn ae)])
+      (duckdb-exec conn
+        "CREATE TABLE IF NOT EXISTS datoms (
+           e         BIGINT   NOT NULL,
+           a         INTEGER  NOT NULL,
+           a_name    VARCHAR,
+           v_long    BIGINT,
+           v_double  DOUBLE,
+           v_string  VARCHAR,
+           v_bool    BOOLEAN,
+           v_ref     BIGINT,
+           v_instant BIGINT,
+           tx        BIGINT   NOT NULL,
+           added     BOOLEAN  NOT NULL
+         )")
+      (duckdb-exec conn
+        "CREATE TABLE IF NOT EXISTS attrs (
+           id          INTEGER PRIMARY KEY,
+           ident       VARCHAR NOT NULL,
+           value_type  VARCHAR,
+           cardinality VARCHAR
+         )")))
 
-  ;; ---- Sync from transaction log ----
+  ;; ---- Sync from a db-value snapshot ----
+  ;;
+  ;; Reads all datoms from the EAVT index and (re)loads them into DuckDB.
+  ;; For simplicity this does a full reload each time (truncate + insert).
+  ;; An incremental variant would track last-synced-tx and only insert new
+  ;; datoms — feasible but requires filtering by tx, so we keep full reload
+  ;; for correctness.
 
-  (def (analytics-sync! ae)
-    ;; Read transaction log entries since last-synced-tx and INSERT datoms.
-    (let* ([log    (analytics-engine-tx-log-ref ae)]
-           [schema (analytics-engine-schema-ref ae)]
-           [last-tx (analytics-engine-last-synced-tx ae)]
-           [entries (tx-log-range log last-tx (+ (tx-log-latest-tx log) 1))])
+  (def (analytics-sync! ae db-val)
+    (let* ([schema  (analytics-engine-schema-ref ae)]
+           [indices (db-value-indices db-val)]
+           [eavt    (index-set-eavt indices)]
+           [datoms  (dbi-datoms eavt)]
+           [conn    (analytics-engine-duckdb-conn ae)])
+      ;; Truncate existing data (full refresh semantics)
+      (duckdb-exec conn "DELETE FROM datoms")
+      (duckdb-exec conn "DELETE FROM attrs")
+      ;; Load attributes
       (for-each
-        (lambda (entry)
-          (for-each
-            (lambda (dv)
-              ;; dv is #(e a v tx added?) — serializable form from tx-log
-              (insert-datom-row! ae schema dv))
-            (tx-log-entry-datoms entry)))
-        entries)
-      (when (pair? entries)
-        (analytics-engine-last-synced-tx-set! ae
-          (tx-log-entry-tx-id (car (reverse entries)))))))
+        (lambda (attr)
+          (duckdb-eval conn
+            "INSERT INTO attrs (id, ident, value_type, cardinality)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT (id) DO NOTHING"
+            (db-attribute-id attr)
+            (symbol->string (db-attribute-ident attr))
+            (let ([vt (db-attribute-value-type attr)])
+              (if vt (symbol->string vt) #f))
+            (let ([c (db-attribute-cardinality attr)])
+              (if c (symbol->string c) #f))))
+        (schema-all-attributes schema))
+      ;; Load datoms
+      (for-each
+        (lambda (d)
+          (insert-datom-row! ae schema d))
+        datoms)
+      ;; Track sync state
+      (analytics-engine-last-synced-tx-set! ae (db-value-basis-tx db-val))
+      (analytics-engine-synced?-set! ae #t)))
 
-  (def (insert-datom-row! ae schema dv)
-    ;; dv is a vector: #(e a v tx added?)
-    (let* ([e      (vector-ref dv 0)]
-           [a      (vector-ref dv 1)]
-           [v      (vector-ref dv 2)]
-           [tx     (vector-ref dv 3)]
-           [added? (vector-ref dv 4)]
-           [attr   (schema-lookup-by-id schema a)]
-           [a-name (if attr (symbol->string (db-attribute-ident attr)) #f)]
-           [vtype  (if attr (db-attribute-value-type attr) #f)])
-      ;; Resolve each typed slot — only one should be non-NULL per row.
-      (let-values ([(v-long v-double v-string v-bool v-ref v-instant)
-                    (classify-value v vtype)])
-        (duckdb-eval
-          (analytics-engine-duckdb-conn ae)
-          "INSERT INTO datoms
-             (e, a, a_name, v_long, v_double, v_string, v_bool, v_ref, v_instant, tx, added)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-          e a a-name
-          v-long v-double v-string v-bool v-ref v-instant
-          tx added?))))
+  ;; ---- Insert a single datom record ----
+
+  (def (insert-datom-row! ae schema d)
+    ;; d may be a datom record or a serializable vector #(e a v tx added?)
+    (let-values ([(e a v tx added?)
+                  (if (datom? d)
+                      (values (datom-e d) (datom-a d) (datom-v d)
+                              (datom-tx d) (datom-added? d))
+                      (values (vector-ref d 0) (vector-ref d 1) (vector-ref d 2)
+                              (vector-ref d 3) (vector-ref d 4)))])
+      (let* ([attr   (schema-lookup-by-id schema a)]
+             [a-name (if attr (symbol->string (db-attribute-ident attr)) #f)]
+             [vtype  (if attr (db-attribute-value-type attr) #f)])
+        (let-values ([(v-long v-double v-string v-bool v-ref v-instant)
+                      (classify-value v vtype)])
+          (duckdb-eval
+            (analytics-engine-duckdb-conn ae)
+            "INSERT INTO datoms
+               (e, a, a_name, v_long, v_double, v_string, v_bool, v_ref, v_instant, tx, added)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            e a a-name
+            v-long v-double v-string v-bool v-ref v-instant
+            tx added?)))))
 
   ;; Map a datom value + schema type to the six typed column slots.
   ;; Returns six values: (v-long v-double v-string v-bool v-ref v-instant).
@@ -128,7 +173,16 @@
        (values #f #f (and (string? v) v) #f #f #f)]
       [(eq? vtype 'db.type/symbol)
        (values #f #f (and (symbol? v) (symbol->string v)) #f #f #f)]
-      ;; No schema — infer from Scheme type
+      [(eq? vtype 'db.type/any)
+       ;; Infer from Scheme type
+       (cond
+         [(boolean? v)  (values #f #f #f v #f #f)]
+         [(flonum? v)   (values #f v #f #f #f #f)]
+         [(integer? v)  (values v #f #f #f #f #f)]
+         [(string? v)   (values #f #f v #f #f #f)]
+         [(symbol? v)   (values #f #f (symbol->string v) #f #f #f)]
+         [else          (values #f #f (format "~s" v) #f #f #f)])]
+      ;; No schema type or unrecognized — infer from Scheme type
       [(boolean? v)   (values #f #f #f v #f #f)]
       [(flonum? v)    (values #f v #f #f #f #f)]
       [(integer? v)   (values v #f #f #f #f #f)]
@@ -137,17 +191,18 @@
       [else           (values #f #f (format "~s" v) #f #f #f)]))
 
   ;; ---- SQL query ----
+  ;;
+  ;; Returns a list of alists, e.g.:
+  ;;   (("e" . 100) ("a_name" . "person/name") ("v_string" . "Alice"))
 
   (def (analytics-query ae sql-string . params)
-    ;; Sync first so the view is up-to-date, then run SQL.
-    (analytics-sync! ae)
-    (apply duckdb-query (analytics-engine-duckdb-conn ae) sql-string params))
+    (let ([conn (analytics-engine-duckdb-conn ae)])
+      (apply duckdb-query conn sql-string params)))
 
   ;; ---- Parquet export ----
 
   (def (export-parquet ae path . opts)
     ;; opts: optional SQL override (default: full datoms table)
-    (analytics-sync! ae)
     (let ([sql (if (pair? opts)
                    (car opts)
                    "SELECT * FROM datoms")])
@@ -155,30 +210,27 @@
 
   ;; ---- Parquet import ----
   ;;
-  ;; mapping: alist of (column-name . attribute-ident)
-  ;; Each row becomes a new entity assertion. All values imported as strings;
-  ;; callers can add type coercion via the schema after import.
+  ;; mapping: alist of (column-name . attribute-ident-symbol)
+  ;; Each row becomes a new entity assertion.
 
   (def (import-parquet ae path mapping)
-    (let ([conn (analytics-engine-duckdb-conn ae)]
-          [schema (analytics-engine-schema-ref ae)]
-          [tx-id  (+ (tx-log-latest-tx (analytics-engine-tx-log-ref ae)) 1)])
+    (let ([conn   (analytics-engine-duckdb-conn ae)]
+          [schema (analytics-engine-schema-ref ae)])
       ;; Use DuckDB to read the parquet and materialise it in-memory
       (let ([rows (duckdb-read-parquet conn path)])
         (for-each
           (lambda (row)
-            ;; Allocate a fresh entity id (use a stable hash of row position
-            ;; relative to tx so re-import is idempotent-ish)
             (let ([eid (next-import-eid ae)])
               (for-each
                 (lambda (col-mapping)
-                  (let* ([col-name (car col-mapping)]
+                  (let* ([col-name   (car col-mapping)]
                          [attr-ident (cdr col-mapping)]
-                         [raw-val  (cdr (or (assoc col-name row) '(#f . #f)))]
-                         [attr     (schema-lookup-by-ident schema attr-ident)]
-                         [a-id     (if attr (db-attribute-id attr) #f)])
+                         [raw-val    (cdr (or (assoc col-name row) (cons col-name #f)))]
+                         [attr       (schema-lookup-by-ident schema attr-ident)]
+                         [a-id       (if attr (db-attribute-id attr) #f)])
                     (when (and raw-val a-id)
-                      (let ([vtype (if attr (db-attribute-value-type attr) #f)])
+                      (let* ([vtype (if attr (db-attribute-value-type attr) #f)]
+                             [a-name (symbol->string attr-ident)])
                         (let-values ([(v-long v-double v-string v-bool v-ref v-instant)
                                       (classify-value raw-val vtype)])
                           (duckdb-eval conn
@@ -186,10 +238,9 @@
                                (e, a, a_name, v_long, v_double, v_string,
                                 v_bool, v_ref, v_instant, tx, added)
                              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-                            eid a-id
-                            (if attr (symbol->string (db-attribute-ident attr)) #f)
+                            eid a-id a-name
                             v-long v-double v-string v-bool v-ref v-instant
-                            tx-id #t))))))
+                            0 #t))))))
                 mapping)))
           rows))))
 
@@ -200,21 +251,21 @@
 
   (def (import-csv ae path mapping)
     (let ([conn   (analytics-engine-duckdb-conn ae)]
-          [schema (analytics-engine-schema-ref ae)]
-          [tx-id  (+ (tx-log-latest-tx (analytics-engine-tx-log-ref ae)) 1)])
+          [schema (analytics-engine-schema-ref ae)])
       (let ([rows (duckdb-read-csv conn path)])
         (for-each
           (lambda (row)
             (let ([eid (next-import-eid ae)])
               (for-each
                 (lambda (col-mapping)
-                  (let* ([col-name  (car col-mapping)]
+                  (let* ([col-name   (car col-mapping)]
                          [attr-ident (cdr col-mapping)]
-                         [raw-val   (cdr (or (assoc col-name row) '(#f . #f)))]
-                         [attr      (schema-lookup-by-ident schema attr-ident)]
-                         [a-id      (if attr (db-attribute-id attr) #f)])
+                         [raw-val    (cdr (or (assoc col-name row) (cons col-name #f)))]
+                         [attr       (schema-lookup-by-ident schema attr-ident)]
+                         [a-id       (if attr (db-attribute-id attr) #f)])
                     (when (and raw-val a-id)
-                      (let ([vtype (if attr (db-attribute-value-type attr) #f)])
+                      (let* ([vtype  (if attr (db-attribute-value-type attr) #f)]
+                             [a-name (symbol->string attr-ident)])
                         (let-values ([(v-long v-double v-string v-bool v-ref v-instant)
                                       (classify-value raw-val vtype)])
                           (duckdb-eval conn
@@ -222,10 +273,9 @@
                                (e, a, a_name, v_long, v_double, v_string,
                                 v_bool, v_ref, v_instant, tx, added)
                              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-                            eid a-id
-                            (if attr (symbol->string (db-attribute-ident attr)) #f)
+                            eid a-id a-name
                             v-long v-double v-string v-bool v-ref v-instant
-                            tx-id #t))))))
+                            0 #t))))))
                 mapping)))
           rows))))
 
@@ -237,7 +287,7 @@
 
   ;; ---- Internal helpers ----
 
-  ;; Simple monotonic counter for import entity IDs.
+  ;; Monotonic counter for import entity IDs.
   ;; Starts well above any normal entity range so imports don't collide.
   (def *import-eid-counter* (expt 2 48))
 

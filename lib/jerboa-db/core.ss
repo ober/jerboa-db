@@ -52,7 +52,12 @@
     make-connection new-db-cache
     connection-current-db-set!
     connection-next-eid connection-next-eid-set!
-    connection-fulltext-index)
+    connection-fulltext-index
+
+    ;; Analytics (DuckDB-backed OLAP)
+    analytics-export! analytics-query analytics-close!
+    new-analytics-engine analytics-sync!
+    export-parquet import-parquet import-csv)
 
   (import (except (chezscheme)
                   make-hash-table hash-table?
@@ -386,5 +391,66 @@
 
   (def (gc-stats conn . opts)
     (apply gc-stats-db (connection-current-db conn) opts))
+
+  ;; ---- Analytics (DuckDB-backed OLAP) ----
+  ;;
+  ;; Loaded lazily so DuckDB is not required for normal operation.
+
+  (def analytics-loaded? #f)
+  (def analytics-new-engine-fn #f)
+  (def analytics-sync-fn #f)
+  (def analytics-query-fn #f)
+  (def analytics-close-fn #f)
+  (def analytics-export-parquet-fn #f)
+  (def analytics-import-parquet-fn #f)
+  (def analytics-import-csv-fn #f)
+
+  (def (ensure-analytics!)
+    (unless analytics-loaded?
+      (eval '(import (jerboa-db analytics)))
+      (set! analytics-new-engine-fn  (eval 'new-analytics-engine))
+      (set! analytics-sync-fn        (eval 'analytics-sync!))
+      (set! analytics-query-fn       (eval 'analytics-query))
+      (set! analytics-close-fn       (eval 'analytics-close))
+      (set! analytics-export-parquet-fn (eval 'export-parquet))
+      (set! analytics-import-parquet-fn (eval 'import-parquet))
+      (set! analytics-import-csv-fn  (eval 'import-csv))
+      (set! analytics-loaded? #t)))
+
+  (def (analytics-export! db-val . opts)
+    (ensure-analytics!)
+    (let* ([schema (db-value-schema db-val)]
+           [path   (if (pair? opts) (car opts) ":memory:")]
+           [ae     (analytics-new-engine-fn schema path)])
+      (analytics-sync-fn ae db-val)
+      ae))
+
+  (def (analytics-query ae sql-string . params)
+    (ensure-analytics!)
+    (apply analytics-query-fn ae sql-string params))
+
+  (def (analytics-close! ae)
+    (ensure-analytics!)
+    (analytics-close-fn ae))
+
+  (def (new-analytics-engine schema . opts)
+    (ensure-analytics!)
+    (apply analytics-new-engine-fn schema opts))
+
+  (def (analytics-sync! ae db-val)
+    (ensure-analytics!)
+    (analytics-sync-fn ae db-val))
+
+  (def (export-parquet ae path . opts)
+    (ensure-analytics!)
+    (apply analytics-export-parquet-fn ae path opts))
+
+  (def (import-parquet ae path mapping)
+    (ensure-analytics!)
+    (analytics-import-parquet-fn ae path mapping))
+
+  (def (import-csv ae path mapping)
+    (ensure-analytics!)
+    (analytics-import-csv-fn ae path mapping))
 
 ) ;; end library
