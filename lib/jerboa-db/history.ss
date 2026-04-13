@@ -12,6 +12,7 @@
     make-db-value db-value?
     db-value-basis-tx db-value-indices db-value-schema
     db-value-as-of-tx db-value-since-tx db-value-history?
+    db-value-stats
 
     ;; Time-travel constructors
     as-of since history
@@ -42,7 +43,8 @@
      schema      ;; schema-registry at this point in time
      as-of-tx    ;; #f for current, or tx-id for time-travel
      since-tx    ;; #f for current, or tx-id for since filter
-     history?))  ;; #t to include retracted datoms
+     history?    ;; #t to include retracted datoms
+     stats))     ;; db-stats record (per-attribute datom counts), or #f
 
   ;; ---- Time-travel constructors ----
 
@@ -54,7 +56,8 @@
       (db-value-schema db)
       tx-id
       (db-value-since-tx db)
-      (db-value-history? db)))
+      (db-value-history? db)
+      (db-value-stats db)))
 
   ;; Return db showing only datoms added after tx-id
   (def (since db tx-id)
@@ -64,7 +67,8 @@
       (db-value-schema db)
       (db-value-as-of-tx db)
       tx-id
-      (db-value-history? db)))
+      (db-value-history? db)
+      (db-value-stats db)))
 
   ;; Return db showing all datoms including retracted ones
   (def (history db)
@@ -74,7 +78,8 @@
       (db-value-schema db)
       (db-value-as-of-tx db)
       (db-value-since-tx db)
-      #t))
+      #t
+      (db-value-stats db)))
 
   ;; ---- Datom filtering ----
 

@@ -6,9 +6,10 @@
 
 (library (jerboa-db migrate)
   (export
-    migrate! migration?
+    migrate! migration? make-migration
     make-rename-attr make-add-index make-remove-index
     make-merge-attr make-split-attr
+    make-retype-attr make-delete-attr
     migration-plan migration-dry-run
 
     ;; Online reindexing
@@ -23,6 +24,7 @@
                   iota 1+ 1-
                   partition
                   make-date make-time
+                  log
                 atom? meta)
           (jerboa prelude)
           (jerboa-db datom)
@@ -52,6 +54,12 @@
   (define-record-type split-op
     (fields from-attr into-a into-b split-fn))
 
+  (define-record-type retype-op
+    (fields attr-ident new-type coerce-fn))
+
+  (define-record-type delete-attr-op
+    (fields attr-ident))
+
   ;; ---- Convenience constructors ----
 
   (def (make-rename-attr from to) (make-rename-op from to))
@@ -59,6 +67,10 @@
   (def (make-remove-index attr) (make-remove-index-op attr))
   (def (make-merge-attr from into fn) (make-merge-op from into fn))
   (def (make-split-attr from a b fn) (make-split-op from a b fn))
+  (def (make-retype-attr attr new-type coerce-fn)
+    (make-retype-op attr new-type coerce-fn))
+  (def (make-delete-attr attr)
+    (make-delete-attr-op attr))
 
   ;; ---- Execute migration ----
 
@@ -84,6 +96,13 @@
              (migrate-split! conn schema
                (split-op-from-attr op) (split-op-into-a op)
                (split-op-into-b op) (split-op-split-fn op))]
+            [(retype-op? op)
+             (migrate-retype! conn schema
+               (retype-op-attr-ident op)
+               (retype-op-new-type op)
+               (retype-op-coerce-fn op))]
+            [(delete-attr-op? op)
+             (migrate-delete-attr! conn schema (delete-attr-op-attr-ident op))]
             [else (error 'migrate! "Unknown migration op" op)]))
         ops)))
 
@@ -165,6 +184,92 @@
                      (,into-b . ,vb))))
                results)))))
 
+  ;; ---- Schema entity lookup helper ----
+
+  (def (find-schema-entity-eid conn ident)
+    ;; Find the entity ID for a schema attribute by its db/ident value.
+    ;; Returns the EID or #f if not found.
+    (let ([results (q `((find ?e)
+                         (in $ ?ident)
+                         (where (?e db/ident ?ident)))
+                      (db conn) ident)])
+      (and (pair? results) (caar results))))
+
+  ;; ---- migrate-retype! ----
+
+  (def (migrate-retype! conn schema attr-ident new-type coerce-fn)
+    ;; Step 1: Validate the attribute exists
+    (let ([attr (schema-lookup-by-ident schema attr-ident)])
+      (unless attr
+        (error 'migrate-retype! "Attribute not found" attr-ident))
+      ;; Step 2: Query all current (entity, value) pairs for this attribute
+      (let ([results (q `((find ?e ?v)
+                           (where (?e ,attr-ident ?v)))
+                        (db conn))])
+        ;; Step 3: Validate that coerce-fn works for all values (safety check before
+        ;; any data is changed — fail fast before touching anything)
+        (for-each
+          (lambda (row)
+            (let ([v (cadr row)])
+              (guard (exn [#t (error 'migrate-retype!
+                                (format "coerce-fn failed for value ~a: ~a"
+                                        v (with-output-to-string
+                                            (lambda () (display-condition exn))))
+                                attr-ident)])
+                (coerce-fn v))))
+          results)
+        ;; Step 4: Retract all existing values (using the old type, which is fine
+        ;; since db/retract does not validate value types)
+        (when (pair? results)
+          (transact! conn
+            (map (lambda (row)
+                   `(db/retract ,(car row) ,attr-ident ,(cadr row)))
+                 results)))
+        ;; Step 5: Update the schema attribute's value-type BEFORE asserting new values.
+        ;; We must include db/ident in this transaction so that materialize-schema-datoms!
+        ;; fires and updates the in-memory schema registry (it only triggers on db/ident datoms).
+        (transact! conn
+          (list `((db/ident . ,attr-ident)
+                  (db/valueType . ,new-type)
+                  (db/cardinality . ,(db-attribute-cardinality attr)))))
+        ;; Step 6: Assert new coerced values (schema is now the new type)
+        (when (pair? results)
+          (transact! conn
+            (map (lambda (row)
+                   `((db/id . ,(car row))
+                     (,attr-ident . ,(coerce-fn (cadr row)))))
+                 results)))
+        ;; Step 7: Rebuild AVET for the attribute if it is indexed
+        (let* ([new-schema (db-value-schema (db conn))]
+               [new-attr   (schema-lookup-by-ident new-schema attr-ident)])
+          (when (and new-attr
+                     (or (db-attribute-index? new-attr)
+                         (db-attribute-unique new-attr)))
+            (reindex-attribute! conn attr-ident)))
+        (length results))))
+
+  ;; ---- migrate-delete-attr! ----
+
+  (def (migrate-delete-attr! conn schema attr-ident)
+    ;; Step 1: Validate the attribute exists
+    (let ([attr (schema-lookup-by-ident schema attr-ident)])
+      (unless attr
+        (error 'migrate-delete-attr! "Attribute not found" attr-ident))
+      ;; Step 2: Query all entities that have this attribute
+      (let ([results (q `((find ?e ?v) (where (?e ,attr-ident ?v)))
+                        (db conn))])
+        ;; Step 3: Retract all data datoms for this attribute
+        (when (pair? results)
+          (transact! conn
+            (map (lambda (row)
+                   `(db/retract ,(car row) ,attr-ident ,(cadr row)))
+                 results)))
+        ;; Step 4: Retract the schema entity for this attribute
+        (let ([schema-eid (find-schema-entity-eid conn attr-ident)])
+          (when schema-eid
+            (transact! conn (list `(db/retractEntity ,schema-eid)))))
+        (length results))))
+
   ;; ---- Planning and dry-run ----
 
   (def (migration-plan migration-obj)
@@ -182,15 +287,50 @@
              [(split-op? op)
               (format "SPLIT ~a into ~a, ~a"
                       (split-op-from-attr op) (split-op-into-a op) (split-op-into-b op))]
+             [(retype-op? op)
+              (format "RETYPE ~a -> ~a" (retype-op-attr-ident op) (retype-op-new-type op))]
+             [(delete-attr-op? op)
+              (format "DELETE ATTRIBUTE ~a (all datoms will be retracted)"
+                      (delete-attr-op-attr-ident op))]
              [else "UNKNOWN"]))
          (migration-operations migration-obj)))
 
   (def (migration-dry-run conn migration-obj)
-    ;; Report what would change without executing
-    (let ([plan (migration-plan migration-obj)])
-      (display "Migration plan:\n")
-      (for-each (lambda (step) (display (format "  ~a\n" step))) plan)
-      plan))
+    ;; Report what would change without executing.
+    ;; Returns a list of descriptors; each descriptor includes an 'affects N datoms'
+    ;; count for operations that touch data.
+    (map
+      (lambda (op)
+        (cond
+          [(rename-op? op)
+           (let ([count (length (q `((find ?e ?v)
+                                      (where (?e ,(rename-op-from-attr op) ?v)))
+                                   (db conn)))])
+             (list 'rename (rename-op-from-attr op) '-> (rename-op-to-attr op)
+                   'affects count 'datoms))]
+          [(retype-op? op)
+           (let ([count (length (q `((find ?e ?v)
+                                      (where (?e ,(retype-op-attr-ident op) ?v)))
+                                   (db conn)))])
+             (list 'retype (retype-op-attr-ident op) '-> (retype-op-new-type op)
+                   'affects count 'datoms))]
+          [(delete-attr-op? op)
+           (let ([count (length (q `((find ?e ?v)
+                                      (where (?e ,(delete-attr-op-attr-ident op) ?v)))
+                                   (db conn)))])
+             (list 'delete (delete-attr-op-attr-ident op)
+                   'affects count 'datoms))]
+          [(add-index-op? op)
+           (list 'add-index (add-index-op-attr-ident op))]
+          [(remove-index-op? op)
+           (list 'remove-index (remove-index-op-attr-ident op))]
+          [(merge-op? op)
+           (list 'merge (merge-op-from-attr op) 'into (merge-op-into-attr op))]
+          [(split-op? op)
+           (list 'split (split-op-from-attr op) 'into
+                 (split-op-into-a op) (split-op-into-b op))]
+          [else (list 'unknown op)]))
+      (migration-operations migration-obj)))
 
 
   ;; ---- Online reindexing ----

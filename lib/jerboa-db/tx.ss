@@ -367,6 +367,39 @@
           (emit-datom! eid aid old-val #f)
           (emit-datom! eid aid new-val #t)))
 
+      ;; --- Stored function (db/fn) lookup ---
+      ;; Returns the procedure stored as db/fn for the entity with db/ident = fn-ident,
+      ;; or #f if no such function is registered.
+      (define (lookup-db-fn fn-ident)
+        (let* ([ident-attr (schema-lookup-by-ident schema +db/ident+)]
+               [fn-attr    (schema-lookup-by-ident schema +db/fn+)])
+          (and ident-attr fn-attr
+               (let* ([ident-aid  (db-attribute-id ident-attr)]
+                      [fn-aid     (db-attribute-id fn-attr)]
+                      [avet       (index-set-avet indices)]
+                      ;; Find entity where db/ident = fn-ident via AVET scan
+                      [lo         (make-datom 0 ident-aid fn-ident 0 #t)]
+                      [hi         (make-datom (greatest-fixnum) ident-aid fn-ident
+                                              (greatest-fixnum) #t)]
+                      [ident-datoms (dbi-range avet lo hi)]
+                      [ident-datom  (find (lambda (d)
+                                            (and (datom-added? d)
+                                                 (db-filter-datom? db d)))
+                                          ident-datoms)])
+                 (and ident-datom
+                      (let* ([eid     (datom-e ident-datom)]
+                             [eavt    (index-set-eavt indices)]
+                             [fn-lo   (make-datom eid fn-aid +min-val+ 0 #t)]
+                             [fn-hi   (make-datom eid fn-aid +max-val+ (greatest-fixnum) #t)]
+                             [fn-datoms (dbi-range eavt fn-lo fn-hi)]
+                             [fn-datom  (find (lambda (d)
+                                                (and (datom-added? d)
+                                                     (db-filter-datom? db d)))
+                                              fn-datoms)])
+                        (and fn-datom
+                             (let ([v (datom-v fn-datom)])
+                               (and (procedure? v) v)))))))))
+
       ;; Effective value for composite tuple generation:
       ;; checks pending produced-datoms first, then falls back to current index value.
       (define (effective-value-for-entity eid attr-ident)
@@ -403,7 +436,45 @@
                 (process-retract-entity! (cadr op))]
                [(db/cas)
                 (process-cas! (cadr op) (caddr op) (cadddr op) (car (cddddr op)))]
-               [else (error 'transact! "Unknown operation" (car op))])]
+               [else
+                ;; Try stored function invocation: (fn-ident arg1 arg2 ...)
+                (let ([fn-proc (lookup-db-fn (car op))])
+                  (unless fn-proc
+                    (error 'transact! "Unknown operation" (car op)))
+                  ;; fn-proc receives the current db-value and user args,
+                  ;; returns a list of additional tx operations to process.
+                  (let ([result-ops (apply fn-proc db (cdr op))])
+                    (unless (list? result-ops)
+                      (error 'db/fn
+                        (format "db/fn ~a must return a list of tx operations"
+                                (car op))))
+                    (for-each
+                      (lambda (sub-op)
+                        (cond
+                          ;; Entity map
+                          [(and (pair? sub-op) (pair? (car sub-op)) (symbol? (caar sub-op)))
+                           (process-entity-map! sub-op)]
+                          ;; Command list
+                          [(and (pair? sub-op) (symbol? (car sub-op)))
+                           (case (car sub-op)
+                             [(db/add)
+                              (process-add! (cadr sub-op) (caddr sub-op) (cadddr sub-op))]
+                             [(db/retract)
+                              (process-retract! (cadr sub-op) (caddr sub-op) (cadddr sub-op))]
+                             [(db/retractEntity)
+                              (process-retract-entity! (cadr sub-op))]
+                             [(db/cas)
+                              (process-cas! (cadr sub-op) (caddr sub-op) (cadddr sub-op)
+                                            (car (cddddr sub-op)))]
+                             [else
+                              (error 'db/fn
+                                (format "db/fn ~a returned unknown sub-operation ~a"
+                                        (car op) (car sub-op)))])]
+                          [else
+                           (error 'db/fn
+                             (format "db/fn ~a returned invalid sub-operation ~a"
+                                     (car op) sub-op))]))
+                      result-ops)))])]
             [else (error 'transact! "Invalid transaction operation" op)]))
         tx-ops)
 
@@ -482,7 +553,7 @@
         (set-car! next-eid-cell next-eid)
 
         ;; Build new db-value
-        (let ([db-after (make-db-value tx-id indices schema #f #f #f)])
+        (let ([db-after (make-db-value tx-id indices schema #f #f #f #f)])
           (make-tx-report db db-after final-datoms tempid-map)))))
 
   ;; ---- Schema transaction handling ----

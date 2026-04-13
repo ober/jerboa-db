@@ -280,6 +280,14 @@
     ;; (not sub-clause ...) — negation
     (and (pair? clause) (eq? (car clause) 'not)))
 
+  (def (not-join-clause? clause)
+    ;; (not-join [?e ?x ...] sub-clause ...)
+    (and (pair? clause)
+         (eq? (car clause) 'not-join)
+         (pair? (cdr clause))
+         (list? (cadr clause))   ;; join-vars list
+         (pair? (cddr clause)))) ;; at least one sub-clause
+
   (def (or-clause? clause)
     ;; (or alt1 alt2 ...) — disjunction
     (and (pair? clause) (eq? (car clause) 'or)))
@@ -483,6 +491,8 @@
     (cond
       [(not-clause? clause)
        (evaluate-not-clause db clause bindings schema rules-ht)]
+      [(not-join-clause? clause)
+       (evaluate-not-join-clause db clause bindings schema rules-ht)]
       [(or-clause? clause)
        (evaluate-or-clause db clause bindings schema rules-ht)]
       [(data-pattern? clause)
@@ -519,6 +529,29 @@
           (list bindings)   ;; not matched -> keep this binding
           '())))            ;; matched -> exclude
 
+  ;; ---- Not-join clause evaluation ----
+  ;; (not-join [?e ?x ...] sub-clause ...) — like not, but only the listed
+  ;; join vars cross into the sub-query; other vars inside are local.
+
+  (def (evaluate-not-join-clause db clause bindings schema rules-ht)
+    (let* ([join-vars   (cadr clause)]
+           [sub-clauses (cddr clause)]
+           ;; Build restricted bindings containing ONLY the join vars
+           [restricted  (let ([new-ht (make-hashtable symbol-hash eq?)])
+                          (for-each
+                            (lambda (v)
+                              (let ([val (binding-ref bindings v)])
+                                (when val (hashtable-set! new-ht v val))))
+                            join-vars)
+                          new-ht)]
+           ;; Evaluate sub-clauses from the restricted binding set only
+           [results (evaluate-where-clauses db sub-clauses
+                      (list restricted) schema rules-ht)])
+      ;; If sub-query produced results → exclude this outer binding
+      (if (null? results)
+          (list bindings)   ;; not matched → keep
+          '())))
+
   ;; ---- Or clause evaluation ----
   ;; (or alt1 alt2 ...) — union of bindings from each alternative.
 
@@ -554,7 +587,7 @@
   ;; for count/sum/avg/min/max (only 3 group objects for Q8's 655K rows).
 
   (def (streamable-aggregate? name)
-    (memq name '(count sum avg min max)))
+    (memq name '(count sum avg min max variance variance-sample stddev stddev-sample)))
 
   (def (init-agg-acc name)
     (case name
@@ -562,7 +595,9 @@
       [(sum)   (vector 0)]
       [(avg)   (vector 0 0)]   ;; #(sum count)
       [(min)   (vector #f)]
-      [(max)   (vector #f)]))
+      [(max)   (vector #f)]
+      [(variance variance-sample stddev stddev-sample)
+       (vector 0 0.0 0.0)]))
 
   (def (update-agg-acc! name acc val)
     (case name
@@ -586,7 +621,18 @@
          (when (or (not cur)
                    (and (number? val) (number? cur) (> val cur))
                    (and (string? val) (string? cur) (string>? val cur)))
-           (vector-set! acc 0 val)))]))
+           (vector-set! acc 0 val)))]
+      [(variance variance-sample stddev stddev-sample)
+       (when (number? val)
+         (let* ([n     (+ (vector-ref acc 0) 1)]
+                [x     (inexact val)]
+                [delta (- x (vector-ref acc 1))]
+                [mean  (+ (vector-ref acc 1) (/ delta n))]
+                [delta2 (- x mean)]
+                [M2    (+ (vector-ref acc 2) (* delta delta2))])
+           (vector-set! acc 0 n)
+           (vector-set! acc 1 mean)
+           (vector-set! acc 2 M2)))]))
 
   (def (finalize-agg-acc name acc)
     (case name
@@ -594,6 +640,18 @@
        (let ([cnt (vector-ref acc 1)])
          (if (= cnt 0) 0
              (inexact (/ (vector-ref acc 0) cnt))))]
+      [(variance)
+       (let ([n (vector-ref acc 0)] [M2 (vector-ref acc 2)])
+         (if (< n 1) 0.0 (/ M2 n)))]
+      [(variance-sample)
+       (let ([n (vector-ref acc 0)] [M2 (vector-ref acc 2)])
+         (if (< n 2) 0.0 (/ M2 (- n 1))))]
+      [(stddev)
+       (let ([n (vector-ref acc 0)] [M2 (vector-ref acc 2)])
+         (if (< n 1) 0.0 (sqrt (/ M2 n))))]
+      [(stddev-sample)
+       (let ([n (vector-ref acc 0)] [M2 (vector-ref acc 2)])
+         (if (< n 2) 0.0 (sqrt (/ M2 (- n 1)))))]
       [else (vector-ref acc 0)]))
 
   (def (streaming-aggregate find-vars grouping-vars agg-specs bindings-list)
@@ -719,6 +777,82 @@
                     (hashtable-set! ht r #t)
                     (loop (cdr rs) (cons r out)))))))))
 
+  ;; ---- Hash-join execution ----
+
+  (def (merge-bindings b1 b2)
+    ;; Merge two binding hashtables; combined keys from both.
+    ;; Values in b2 override b1 on conflict (shouldn't conflict on non-join vars).
+    (let ([new-ht (hashtable-copy b1 #t)])
+      (let-values ([(keys vals) (hashtable-entries b2)])
+        (vector-for-each (lambda (k v) (hashtable-set! new-ht k v)) keys vals))
+      new-ht))
+
+  (def (evaluate-hash-join db ca cb join-vars bindings-list schema)
+    ;; Step 1: evaluate ca from current bindings → side-A
+    (let* ([side-a (let loop ([lst bindings-list] [acc '()])
+                     (if (null? lst)
+                         (reverse acc)
+                         (loop (cdr lst)
+                               (append (reverse
+                                         (evaluate-single-clause db ca (car lst) schema #f))
+                                       acc))))]
+           ;; Step 2: build probe table HT[join-key] → list of side-A bindings
+           [ht (make-hashtable equal-hash equal?)])
+      (for-each
+        (lambda (b)
+          (let ([key (map (lambda (v) (binding-ref b v)) join-vars)])
+            (hashtable-update! ht key
+              (lambda (existing) (cons b existing))
+              '())))
+        side-a)
+      ;; Step 3: evaluate cb from current bindings → side-B
+      (let ([side-b (let loop ([lst bindings-list] [acc '()])
+                      (if (null? lst)
+                          (reverse acc)
+                          (loop (cdr lst)
+                                (append (reverse
+                                          (evaluate-single-clause db cb (car lst) schema #f))
+                                        acc))))])
+        ;; Step 4: probe — for each side-B binding, find matching side-A bindings
+        (let loop ([lst side-b] [acc '()])
+          (if (null? lst)
+              (reverse acc)
+              (let* ([b-binding (car lst)]
+                     [key (map (lambda (v) (binding-ref b-binding v)) join-vars)]
+                     [matches (hashtable-ref ht key '())])
+                (loop (cdr lst)
+                      (append (reverse
+                                (map (lambda (a-binding)
+                                       (merge-bindings a-binding b-binding))
+                                     matches))
+                              acc))))))))
+
+  (def (evaluate-plan db hj-plan bindings-list schema rules-ht)
+    (if (null? hj-plan)
+        bindings-list
+        (let* ([step (car hj-plan)]
+               [rest (cdr hj-plan)]
+               [step-type (car step)]
+               [new-bindings
+                 (cond
+                   [(eq? step-type 'sequential)
+                    (let ([clause (cadr step)])
+                      (let loop ([lst bindings-list] [acc '()])
+                        (if (null? lst)
+                            (reverse acc)
+                            (loop (cdr lst)
+                                  (append (reverse
+                                            (evaluate-single-clause
+                                             db clause (car lst) schema rules-ht))
+                                          acc)))))]
+                   [(eq? step-type 'hash-join)
+                    (evaluate-hash-join db (cadr step) (caddr step) (cadddr step)
+                                        bindings-list schema)]
+                   [else (error 'evaluate-plan "Unknown step type" step-type)])])
+          (if (null? new-bindings)
+              '()
+              (evaluate-plan db rest new-bindings schema rules-ht)))))
+
   ;; ---- Top-level query function ----
 
   (def (query-db parsed db . inputs)
@@ -802,14 +936,23 @@
            ;; input-bindings is now a list of binding-sets
            [bound-at-start (if (null? input-bindings) '()
                                (vector->list (hashtable-keys (car input-bindings))))]
-           [ordered-clauses (reorder-clauses where-clauses bound-at-start schema)]
+           [db-stats (db-value-stats db)]
+           [ordered-clauses (reorder-clauses where-clauses bound-at-start schema db-stats)]
            ;; Compute live variable sets for projection pushdown
            [live-vars-steps (compute-live-vars-at-each-step ordered-clauses find-vars)]
-           ;; Execute
+           ;; Compute hash-join plan for top-level clause execution
+           [hj-plan (hash-join-plan ordered-clauses bound-at-start schema)]
+           ;; Execute: use evaluate-plan for top-level (hash-join aware),
+           ;; evaluate-where-clauses is kept for recursive sub-query calls.
+           ;; If hash-join plan has any hash-join steps, use evaluate-plan.
+           ;; Otherwise fall through to the projection-aware evaluate-where-clauses.
+           [has-hash-joins? (exists (lambda (s) (eq? (car s) 'hash-join)) hj-plan)]
            [result-bindings
-             (evaluate-where-clauses db ordered-clauses
-                                     input-bindings schema rules-from-input
-                                     live-vars-steps)])
+             (if has-hash-joins?
+                 (evaluate-plan db hj-plan input-bindings schema rules-from-input)
+                 (evaluate-where-clauses db ordered-clauses
+                                         input-bindings schema rules-from-input
+                                         live-vars-steps))])
       (extract-find-results find-vars result-bindings)))
 
   ;; Helper: find position of element in list
@@ -845,7 +988,8 @@
                     (loop (cdr ivs) (cdr inps) (append vars bound)))]
                  [else
                   (loop (cdr ivs) (cdr inps) (cons (car ivs) bound))]))]
-           [ordered-clauses (reorder-clauses where-clauses bound-at-start schema)])
+           [db-stats (db-value-stats db-val)]
+           [ordered-clauses (reorder-clauses where-clauses bound-at-start schema db-stats)])
       ;; Build plan: for each clause, describe it and the chosen index
       (let build-plan ([clauses ordered-clauses] [bound bound-at-start] [plan '()])
         (if (null? clauses)

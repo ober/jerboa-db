@@ -9,7 +9,8 @@
     reorder-clauses choose-index
     clause-bound-vars clause-used-vars
     score-clause
-    compute-live-vars-at-each-step)
+    compute-live-vars-at-each-step
+    hash-join-plan)
 
   (import (except (chezscheme)
                   make-hash-table hash-table?
@@ -22,7 +23,8 @@
                   make-date make-time
                 atom? meta)
           (jerboa prelude)
-          (jerboa-db schema))
+          (jerboa-db schema)
+          (jerboa-db stats))
 
   ;; ---- Variable detection ----
 
@@ -32,12 +34,24 @@
            (and (> (string-length s) 0)
                 (char=? (string-ref s 0) #\?)))))
 
+  ;; A data pattern: (something attr-symbol something ...)
+  ;; First element is a var or literal, second is a non-logic-var symbol (attribute)
+  (def (data-pattern? clause)
+    (and (pair? clause)
+         (not (pair? (car clause)))
+         (>= (length clause) 3)
+         (symbol? (cadr clause))
+         (not (logic-var? (cadr clause)))))
+
   ;; Variables that a data-pattern clause binds (introduces)
   (def (clause-bound-vars clause already-bound)
     (filter (lambda (v) (and (logic-var? v) (not (memq v already-bound))))
             (cond
               ;; Not clause: (not sub-clause ...) — binds nothing (filter only)
               [(and (pair? clause) (eq? (car clause) 'not))
+               '()]
+              ;; Not-join clause: (not-join [vars...] sub-clause ...) — binds nothing
+              [(and (pair? clause) (eq? (car clause) 'not-join))
                '()]
               ;; Or clause: (or alt ...) — binds the union of what alternatives bind
               [(and (pair? clause) (eq? (car clause) 'or))
@@ -68,6 +82,11 @@
       ;; Not/or: collect vars from sub-clauses
       [(and (pair? clause) (memq (car clause) '(not or)))
        (apply append (map clause-used-vars (cdr clause)))]
+      ;; Not-join: uses explicit join vars plus vars in sub-clauses
+      [(and (pair? clause) (eq? (car clause) 'not-join))
+       (let ([join-vars (cadr clause)]
+             [sub-vars  (apply append (map clause-used-vars (cddr clause)))])
+         (append join-vars sub-vars))]
       [(and (pair? clause) (not (pair? (car clause))))
        (filter logic-var? clause)]
       [(and (pair? clause) (pair? (car clause)))
@@ -76,65 +95,83 @@
 
   ;; ---- Selectivity scoring ----
   ;; Higher score = more selective = should come first.
+  ;; Optional db-stats argument enables attribute-count-based scoring.
 
-  (def (score-clause clause bound-vars schema)
-    (cond
-      ;; Not clause: should come after its sub-clause vars are bound.
-      ;; Score low so it's placed late (it's a filter).
-      [(and (pair? clause) (eq? (car clause) 'not))
-       (let ([used (clause-used-vars clause)])
-         (if (for-all (lambda (v) (memq v bound-vars)) used) 3 -100))]
-      ;; Or clause: score like the best alternative
-      [(and (pair? clause) (eq? (car clause) 'or))
-       (let ([alt-scores (map (lambda (alt) (score-clause alt bound-vars schema))
-                               (cdr clause))])
-         (if (null? alt-scores) 0 (apply max alt-scores)))]
-      ;; Data pattern: (?e attr ?v ...)
-      [(and (pair? clause) (not (pair? (car clause)))
-            (>= (length clause) 3))
-       (let* ([e-pos (car clause)]
-              [a-pos (cadr clause)]
-              [v-pos (caddr clause)]
-              [e-bound? (or (not (logic-var? e-pos)) (memq e-pos bound-vars))]
-              [a-bound? (not (logic-var? a-pos))]  ;; attrs are always concrete
-              [v-bound? (or (not (logic-var? v-pos)) (memq v-pos bound-vars))])
-         (let ([attr (and a-bound? (schema-lookup-by-ident schema a-pos))])
-           (+
-             (if e-bound? 100 0)        ;; entity bound: very selective
-             (if (and attr (db-attribute-unique attr)) 90 0)  ;; unique attr: point lookup
-             ;; V-bound + scalar attr: AVET range scan (fast).
-             ;; V-bound + ref attr: VAET reverse lookup (also fast).
-             (if v-bound? (if (and attr (avet-eligible? attr)) 60 50) 0)
-             (if a-bound? 20 0))))]  ;; attribute bound (always true for valid queries)
-      ;; Predicate/function clauses: if ALL vars are bound, score maximally so
-      ;; the clause fires as an early filter immediately after its last dep.
-      ;; Otherwise score proportionally to bound vars.
-      [(and (pair? clause) (pair? (car clause)))
-       (let ([used (clause-used-vars clause)])
-         (if (for-all (lambda (v) (memq v bound-vars)) used)
-             1000
-             (* 5 (length (filter (lambda (v) (memq v bound-vars)) used)))))]
-      [else 0]))
+  (def (score-clause clause bound-vars schema . rest)
+    (let ([db-stats (and (pair? rest) (car rest))])
+      (cond
+        ;; Not clause: should come after its sub-clause vars are bound.
+        ;; Score low so it's placed late (it's a filter).
+        [(and (pair? clause) (eq? (car clause) 'not))
+         (let ([used (clause-used-vars clause)])
+           (if (for-all (lambda (v) (memq v bound-vars)) used) 3 -100))]
+        ;; Not-join clause: score 3 when all join vars are bound, -100 otherwise.
+        [(and (pair? clause) (eq? (car clause) 'not-join))
+         (let ([join-vars (cadr clause)])
+           (if (for-all (lambda (v) (memq v bound-vars)) join-vars) 3 -100))]
+        ;; Or clause: score like the best alternative
+        [(and (pair? clause) (eq? (car clause) 'or))
+         (let ([alt-scores (map (lambda (alt) (score-clause alt bound-vars schema db-stats))
+                                 (cdr clause))])
+           (if (null? alt-scores) 0 (apply max alt-scores)))]
+        ;; Data pattern: (?e attr ?v ...)
+        [(and (pair? clause) (not (pair? (car clause)))
+              (>= (length clause) 3))
+         (let* ([e-pos (car clause)]
+                [a-pos (cadr clause)]
+                [v-pos (caddr clause)]
+                [e-bound? (or (not (logic-var? e-pos)) (memq e-pos bound-vars))]
+                [a-bound? (not (logic-var? a-pos))]  ;; attrs are always concrete
+                [v-bound? (or (not (logic-var? v-pos)) (memq v-pos bound-vars))])
+           (let* ([attr (and a-bound? (schema-lookup-by-ident schema a-pos))]
+                  [aid  (and attr (db-attribute-id attr))]
+                  ;; Stats-based bonus: smaller attribute -> higher score.
+                  ;; Only applies when entity is unbound (otherwise EAVT point-lookup
+                  ;; dominates regardless of attribute cardinality).
+                  ;; Divide by 10: contributes 0-90, below entity-bound (100) and
+                  ;; unique-attr (90) but above plain attribute-bound (20).
+                  [stat-bonus (if (and db-stats aid (not e-bound?))
+                                  (quotient (db-stats-selectivity-score db-stats aid) 10)
+                                  0)])
+             (+
+               (if e-bound? 100 0)        ;; entity bound: very selective
+               (if (and attr (db-attribute-unique attr)) 90 0)  ;; unique attr: point lookup
+               ;; V-bound + scalar attr: AVET range scan (fast).
+               ;; V-bound + ref attr: VAET reverse lookup (also fast).
+               (if v-bound? (if (and attr (avet-eligible? attr)) 60 50) 0)
+               (if a-bound? 20 0)
+               stat-bonus)))]  ;; 0-90 based on attribute selectivity
+        ;; Predicate/function clauses: if ALL vars are bound, score maximally so
+        ;; the clause fires as an early filter immediately after its last dep.
+        ;; Otherwise score proportionally to bound vars.
+        [(and (pair? clause) (pair? (car clause)))
+         (let ([used (clause-used-vars clause)])
+           (if (for-all (lambda (v) (memq v bound-vars)) used)
+               1000
+               (* 5 (length (filter (lambda (v) (memq v bound-vars)) used)))))]
+        [else 0])))
 
   ;; ---- Clause reordering ----
   ;; Greedy algorithm: pick the highest-scoring clause, add its bindings,
   ;; repeat until all clauses are placed.
+  ;; Optional db-stats argument enables attribute-count-based ordering.
 
-  (def (reorder-clauses clauses initial-bound-vars schema)
-    (let loop ([remaining clauses]
-               [bound-vars initial-bound-vars]
-               [result '()])
-      (if (null? remaining)
-          (reverse result)
-          (let* ([scored (map (lambda (c)
-                                (cons (score-clause c bound-vars schema) c))
-                              remaining)]
-                 [sorted (sort scored (lambda (a b) (> (car a) (car b))))]
-                 [best (cdar sorted)]
-                 [new-bound (clause-bound-vars best bound-vars)])
-            (loop (remq best remaining)
-                  (append new-bound bound-vars)
-                  (cons best result))))))
+  (def (reorder-clauses clauses initial-bound-vars schema . rest)
+    (let ([db-stats (and (pair? rest) (car rest))])
+      (let loop ([remaining clauses]
+                 [bound-vars initial-bound-vars]
+                 [result '()])
+        (if (null? remaining)
+            (reverse result)
+            (let* ([scored (map (lambda (c)
+                                  (cons (score-clause c bound-vars schema db-stats) c))
+                                remaining)]
+                   [sorted (sort scored (lambda (a b) (> (car a) (car b))))]
+                   [best (cdar sorted)]
+                   [new-bound (clause-bound-vars best bound-vars)])
+              (loop (remq best remaining)
+                    (append new-bound bound-vars)
+                    (cons best result)))))))
 
   ;; ---- Live variable analysis (projection pushdown support) ----
 
@@ -190,5 +227,61 @@
         [(and v-bound? attr (avet-eligible? attr)) 'avet]
         ;; Default: scan by attribute -> AEVT
         [else 'aevt])))
+
+  ;; ---- Hash-join plan ----
+  ;; Analyze a list of reordered clauses and group consecutive data-pattern pairs
+  ;; that form a binary join (share an unbound variable, both are data patterns,
+  ;; and the shared var isn't already bound from outside).
+  ;; Returns a list of plan steps, each one of:
+  ;;   (hash-join clause-A clause-B join-vars) — execute as hash-join
+  ;;   (sequential clause)                     — execute normally
+
+  (def (hash-join-plan clauses initial-bound-vars schema)
+    (let loop ([clauses clauses] [bound initial-bound-vars] [result '()])
+      (cond
+        [(null? clauses)
+         (reverse result)]
+        [(null? (cdr clauses))
+         ;; Last clause — always sequential
+         (reverse (cons (list 'sequential (car clauses)) result))]
+        [else
+         (let* ([ca     (car clauses)]
+                [cb     (cadr clauses)]
+                [vars-a (filter logic-var? (clause-used-vars ca))]
+                [vars-b (filter logic-var? (clause-used-vars cb))]
+                ;; Shared vars that are NOT already bound from outside
+                [shared (filter (lambda (v)
+                                  (and (memq v vars-a)
+                                       (memq v vars-b)
+                                       (not (memq v bound))))
+                                vars-a)]
+                ;; Only hash-join if: both are bare data patterns, share ≥1 unbound var,
+                ;; and both patterns have no entity pre-bound (otherwise EAVT point-lookup
+                ;; is always faster than a hash-join).
+                ;; Correctness requirement: neither clause may reference a bound var that
+                ;; the other doesn't also reference — otherwise the two sides would see
+                ;; different external constraints and produce incorrect cross-product rows.
+                [bound-in-a (filter (lambda (v) (memq v bound)) vars-a)]
+                [bound-in-b (filter (lambda (v) (memq v bound)) vars-b)]
+                ;; Each bound-var used by A must also appear in B, and vice versa.
+                [symmetric-bound?
+                  (and (for-all (lambda (v) (memq v vars-b)) bound-in-a)
+                       (for-all (lambda (v) (memq v vars-a)) bound-in-b))]
+                [joinable? (and (pair? shared)
+                                (data-pattern? ca)
+                                (data-pattern? cb)
+                                symmetric-bound?
+                                ;; Don't hash-join when entity is bound — EAVT wins
+                                (logic-var? (car ca))
+                                (not (memq (car ca) bound))
+                                (logic-var? (car cb))
+                                (not (memq (car cb) bound)))])
+           (if joinable?
+               (let ([new-bound (append vars-a vars-b bound)])
+                 (loop (cddr clauses) new-bound
+                       (cons (list 'hash-join ca cb shared) result)))
+               (let ([new-bound (append (clause-bound-vars ca bound) bound)])
+                 (loop (cdr clauses) new-bound
+                       (cons (list 'sequential ca) result)))))])))
 
 ) ;; end library

@@ -48,11 +48,19 @@
     make-value-store value-store-put! value-store-get
     value-store-has? value-store-close value-store-stats
 
+    ;; Transaction log navigation
+    log log? log-tx-range log-tx-list
+
+    ;; Index range and seek
+    index-range seek-datoms
+
     ;; Internal constructors (used by backup/restore)
     make-connection new-db-cache
     connection-current-db-set!
     connection-next-eid connection-next-eid-set!
     connection-fulltext-index
+    connection-tx-log
+    connection-db-stats
 
     ;; Analytics (DuckDB-backed OLAP)
     analytics-export! analytics-query analytics-close!
@@ -68,6 +76,7 @@
                   iota 1+ 1-
                   partition
                   make-date make-time
+                  log
                 atom? meta)
           (jerboa prelude)
           (jerboa-db datom)
@@ -83,7 +92,9 @@
           (jerboa-db fulltext)
           (jerboa-db gc)
           (jerboa-db spec)
-          (jerboa-db value-store))
+          (jerboa-db value-store)
+          (jerboa-db log)
+          (jerboa-db stats))
 
   ;; ---- Connection ----
   ;; A connection holds the mutable state: current db-value, entity counter,
@@ -96,7 +107,8 @@
      db-cache        ;; LRU cache
      path            ;; storage path (":memory:" for in-memory)
      db-handles      ;; LevelDB handles for cleanup (#f for in-memory)
-     fulltext-index)) ;; in-memory fulltext inverted index
+     fulltext-index  ;; in-memory fulltext inverted index
+     db-stats))      ;; db-stats record: per-attribute datom counts
 
   ;; ---- connect ----
   ;; path = ":memory:" → in-memory RB-tree indices
@@ -125,7 +137,8 @@
                         (ensure-leveldb!)
                         (leveldb-make-index-set path)))])
       (let* ([schema (new-schema-registry)]
-             [initial-db (make-db-value 0 indices schema #f #f #f)]
+             [stats (make-db-stats)]
+             [initial-db (make-db-value 0 indices schema #f #f #f stats)]
              [conn (make-connection
                      initial-db
                      (list +first-user-attr-id+)
@@ -133,7 +146,8 @@
                      (new-db-cache 10000)
                      path
                      handles
-                     (make-fulltext-index))])
+                     (make-fulltext-index)
+                     stats)])
         conn)))
 
   ;; ---- close ----
@@ -160,16 +174,29 @@
       ;; Update schema if schema attributes were transacted
       (materialize-schema-datoms! (db-value-schema (tx-report-db-after report))
                                    (tx-report-tx-data report))
-      ;; Update connection state
-      (connection-current-db-set! conn (tx-report-db-after report))
-      (connection-tx-log-set! conn (cons report (connection-tx-log conn)))
-      ;; Clear entity cache (conservative — could be smarter)
-      (cache-clear! (connection-db-cache conn))
-      ;; Update fulltext index with new datoms
-      (fulltext-index-datoms! (connection-fulltext-index conn)
-                               (db-value-schema (tx-report-db-after report))
-                               (tx-report-tx-data report))
-      report))
+      ;; Update per-attribute statistics incrementally
+      (let* ([stats (connection-db-stats conn)]
+             [db-after-raw (tx-report-db-after report)]
+             ;; Attach live stats to the new db-value so queries can use them
+             [db-after (make-db-value
+                         (db-value-basis-tx db-after-raw)
+                         (db-value-indices db-after-raw)
+                         (db-value-schema db-after-raw)
+                         (db-value-as-of-tx db-after-raw)
+                         (db-value-since-tx db-after-raw)
+                         (db-value-history? db-after-raw)
+                         stats)])
+        (db-stats-update! stats (tx-report-tx-data report))
+        ;; Update connection state
+        (connection-current-db-set! conn db-after)
+        (connection-tx-log-set! conn (cons report (connection-tx-log conn)))
+        ;; Clear entity cache (conservative — could be smarter)
+        (cache-clear! (connection-db-cache conn))
+        ;; Update fulltext index with new datoms
+        (fulltext-index-datoms! (connection-fulltext-index conn)
+                                 (db-value-schema db-after)
+                                 (tx-report-tx-data report))
+        report)))
 
   ;; ---- Schema materialization ----
   ;; When datoms define schema attributes, materialize them into the registry.
@@ -255,6 +282,14 @@
                                         (and (>= tx start-tx) (< tx end-tx))))
                                     tx-data)])
               (loop (cdr log) (append matching result)))))))
+
+  ;; ---- Transaction log navigation (log API) ----
+
+  (def (log conn)
+    "Return a navigable log-handle wrapping conn's transaction history."
+    (make-log-handle (connection-tx-log conn)))
+
+  ;; log?, log-tx-list, log-tx-range are re-exported directly from (jerboa-db log)
 
   ;; ---- Utilities ----
 
@@ -374,6 +409,34 @@
                         (and (db-filter-datom? db d)
                              (datom-added? d)))
                       raw))))))
+
+  ;; ---- index-range ----
+  ;; (index-range db attr-ident start end)
+  ;; Returns AVET datoms for attr whose value is in [start, end] (both inclusive).
+  ;; Either start or end may be #f for open-ended ranges.
+
+  (def (index-range db attr-ident start end)
+    (let* ([schema (db-value-schema db)]
+           [attr   (schema-lookup-by-ident schema attr-ident)]
+           [aid    (if attr (db-attribute-id attr)
+                       (error 'index-range "Unknown attribute" attr-ident))]
+           [idx    (db-resolve-index db 'avet)]
+           [lo     (make-datom 0 aid (if start start +min-val+) 0 #t)]
+           [hi     (make-datom (greatest-fixnum) aid
+                               (if end end +max-val+) (greatest-fixnum) #t)]
+           [raw    (dbi-range idx lo hi)])
+      (filter (lambda (d)
+                (and (db-filter-datom? db d)
+                     (datom-added? d)))
+              raw)))
+
+  ;; ---- seek-datoms ----
+  ;; (seek-datoms db index-name components...)
+  ;; Like datoms but semantically a positioned scan — delegates to datoms.
+  ;; Returns all datoms matching the given component prefix.
+
+  (def (seek-datoms db index-name . components)
+    (apply datoms db index-name components))
 
   ;; ---- Fulltext search ----
   ;; Search for text in fulltext-indexed attributes on this connection.

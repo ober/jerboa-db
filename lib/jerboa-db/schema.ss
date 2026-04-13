@@ -33,7 +33,10 @@
     cardinality-one? cardinality-many? ref-type? indexed-attr? avet-eligible?
 
     ;; Bootstrap
-    bootstrap-schema!)
+    bootstrap-schema!
+
+    ;; Stored database functions
+    +db/fn+)
 
   (import (except (chezscheme)
                   make-hash-table hash-table?
@@ -130,6 +133,7 @@
   (def +db/fulltext+    'db/fulltext)
   (def +spec/ident+     'spec/ident)
   (def +spec/attrs+     'spec/attrs)
+  (def +db/fn+          'db/fn)
 
   (def +first-user-attr-id+ 20)
 
@@ -154,6 +158,7 @@
     (install! 11 +db/fulltext+    'db.type/boolean 'db.cardinality/one)
     (install! 12 +spec/ident+     'db.type/keyword 'db.cardinality/one)
     (install! 13 +spec/attrs+     'db.type/any     'db.cardinality/one)
+    (install! 14 +db/fn+          'db.type/any     'db.cardinality/one)
     (schema-registry-next-id-set! reg +first-user-attr-id+))
 
   ;; ---- Value type validation ----

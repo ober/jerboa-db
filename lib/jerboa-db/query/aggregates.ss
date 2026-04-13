@@ -39,6 +39,16 @@
 
   ;; ---- Built-in aggregates ----
 
+  ;; Welford one-pass variance helper (pure function, no state)
+  (def (welford-variance vals bessel?)
+    (let* ([nums (filter number? vals)]
+           [n    (length nums)])
+      (if (< n 2) 0.0
+          (let* ([mean (/ (apply + nums) n)]
+                 [ss   (apply + (map (lambda (x) (let ([d (- x mean)]) (* d d))) nums))]
+                 [denom (if bessel? (- n 1) n)])
+            (inexact (/ ss denom))))))
+
   ;; count: number of values
   (register-aggregate! 'count length)
 
@@ -109,5 +119,21 @@
 
   (register-aggregate! 'rand
     (lambda (vs) vs))  ;; alias for sample
+
+  ;; population variance (Datomic-compatible default)
+  (register-aggregate! 'variance
+    (lambda (vs) (welford-variance vs #f)))
+
+  ;; sample variance (Bessel-corrected, n-1 denominator)
+  (register-aggregate! 'variance-sample
+    (lambda (vs) (welford-variance vs #t)))
+
+  ;; population stddev
+  (register-aggregate! 'stddev
+    (lambda (vs) (sqrt (welford-variance vs #f))))
+
+  ;; sample stddev
+  (register-aggregate! 'stddev-sample
+    (lambda (vs) (sqrt (welford-variance vs #t))))
 
 ) ;; end library

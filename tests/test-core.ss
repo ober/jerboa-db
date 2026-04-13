@@ -436,6 +436,51 @@
                      (db conn))])
     (assert-equal (caar results) 30)))  ;; median of 25,30,42
 
+;; ---- Variance and stddev aggregates ----
+
+(test "variance aggregate (population)"
+  (let* ([conn (make-person-db)]
+         [_ (transact! conn
+              (list
+                `((person/name . "Alice") (person/age . 10))
+                `((person/name . "Bob") (person/age . 20))
+                `((person/name . "Carol") (person/age . 30))))]
+         ;; population variance of 10,20,30: mean=20, ss=(100+0+100)=200, var=200/3≈66.67
+         [results (q '((find (variance ?age))
+                       (where (?e person/age ?age)))
+                     (db conn))])
+    (let ([v (caar results)])
+      (assert-true (> v 66.0))
+      (assert-true (< v 67.0)))))
+
+(test "stddev aggregate (population)"
+  (let* ([conn (make-person-db)]
+         [_ (transact! conn
+              (list
+                `((person/name . "Alice") (person/age . 10))
+                `((person/name . "Bob") (person/age . 20))
+                `((person/name . "Carol") (person/age . 30))))]
+         ;; stddev = sqrt(200/3) ≈ 8.165
+         [results (q '((find (stddev ?age))
+                       (where (?e person/age ?age)))
+                     (db conn))])
+    (let ([s (caar results)])
+      (assert-true (> s 8.0))
+      (assert-true (< s 8.5)))))
+
+(test "variance-sample aggregate (Bessel-corrected)"
+  (let* ([conn (make-person-db)]
+         [_ (transact! conn
+              (list
+                `((person/name . "Alice") (person/age . 10))
+                `((person/name . "Bob") (person/age . 20))
+                `((person/name . "Carol") (person/age . 30))))]
+         ;; sample variance of 10,20,30: ss=200, denom=2, var=100
+         [results (q '((find (variance-sample ?age))
+                       (where (?e person/age ?age)))
+                     (db conn))])
+    (assert-equal (caar results) 100.0)))
+
 ;; ---- Lookup refs ----
 
 (test "lookup ref in transaction"

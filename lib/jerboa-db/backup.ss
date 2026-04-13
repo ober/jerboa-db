@@ -195,13 +195,15 @@
                            +first-user-attr-id+
                            datom-list)])
             ;; Build the initial db-value
-            (let* ([initial-db (make-db-value basis-tx indices schema #f #f #f)]
+            (let* ([initial-db (make-db-value basis-tx indices schema #f #f #f #f)]
                    [conn (make-connection
                            initial-db
                            (list (+ max-eid 1))
                            '()
                            (new-db-cache 10000)
                            ":memory:"
+                           #f     ;; db-handles
+                           #f     ;; fulltext-index
                            #f)])
               conn))))))
 
