@@ -119,6 +119,748 @@ they are unimplemented (❌), implemented (✅), or planned stubs (🚧).
 
 ---
 
+## Roadmap: Closing the Gaps
+
+Detailed implementation specs for every ❌ and 🚧 item above.  Ordered from
+smallest to largest effort.  Each entry names the files to touch, the exact
+data structures and algorithms, and the expected test impact.
+
+---
+
+### Quick Wins (hours to a day each)
+
+#### `variance` and `stddev` aggregates
+
+**File:** `lib/jerboa-db/query/aggregates.ss`
+
+Add two entries to the aggregate dispatch table alongside the existing
+`count`/`sum`/`avg`/`median`.  Both can be computed in a single pass using
+Welford's online algorithm, which avoids materializing all values:
+
+```scheme
+;; Welford accumulator: #(n mean M2)
+;; n   = count of values seen
+;; mean = running mean
+;; M2  = sum of squared deviations from mean
+(def (init-welford-acc) (vector 0 0.0 0.0))
+
+(def (update-welford! acc val)
+  (when (number? val)
+    (let* ([n    (+ (vector-ref acc 0) 1)]
+           [delta  (- (inexact val) (vector-ref acc 1))]
+           [mean   (+ (vector-ref acc 1) (/ delta n))]
+           [delta2 (- (inexact val) mean)]
+           [M2   (+ (vector-ref acc 2) (* delta delta2))])
+      (vector-set! acc 0 n)
+      (vector-set! acc 1 mean)
+      (vector-set! acc 2 M2))))
+
+(def (finalize-variance acc)           ; population variance
+  (let ([n (vector-ref acc 0)])
+    (if (< n 2) 0.0 (/ (vector-ref acc 2) n))))
+
+(def (finalize-variance-sample acc)    ; sample variance (Bessel-corrected)
+  (let ([n (vector-ref acc 0)])
+    (if (< n 2) 0.0 (/ (vector-ref acc 2) (- n 1)))))
+
+(def (finalize-stddev acc)             ; population stddev
+  (sqrt (finalize-variance acc)))
+
+(def (finalize-stddev-sample acc)      ; sample stddev
+  (sqrt (finalize-variance-sample acc)))
+```
+
+Wire into the streaming aggregation engine (`engine.ss`) by adding `variance`,
+`stddev`, `variance-sample`, `stddev-sample` to `streamable-aggregate?`, and
+adding cases to `init-agg-acc`, `update-agg-acc!`, and `finalize-agg-acc`.
+The query syntax is `(variance ?x)` and `(stddev ?x)` in the `:find` clause,
+identical to `(avg ?x)`.
+
+Also add `variance`/`stddev` to the fallback `aggregate-apply` in
+`aggregates.ss` for the non-streaming path.
+
+**Test addition:** Add to `tests/query-tests.ss`:
+```scheme
+(test "variance aggregate"
+  (= (caar (q '((find (variance ?v)) (where (?e thing/v ?v))) db))
+     2.0))   ;; values 1 2 3 → variance = 2/3 ≈ 0.667 ... adjust for pop vs sample
+```
+
+---
+
+#### `not-join` clause
+
+**File:** `lib/jerboa-db/query/engine.ss`, `lib/jerboa-db/query/planner.ss`
+
+Datomic's `not-join` is like `not` but with an explicit list of join variables.
+The difference: `(not [?e] (?e :attr ?v))` means "exclude `?e` values for
+which the sub-query succeeds, joining only on `?e`" — any other vars introduced
+inside the `not-join` are local and not unified with the outer query.
+
+In contrast, `(not (?e :attr ?v))` would also unify `?v` if it happened to be
+bound in the outer context.  `not-join` gives precise control over which
+variables cross the boundary.
+
+**Parser change** in `parse-query` / `evaluate-single-clause`:
+```scheme
+;; Detect (not-join [?e ?x] sub-clause ...)
+(def (not-join-clause? clause)
+  (and (pair? clause) (eq? (car clause) 'not-join)
+       (pair? (cdr clause)) (list? (cadr clause))   ; join-vars list
+       (pair? (cddr clause))))                        ; at least one sub-clause
+
+(def (evaluate-not-join-clause db clause bindings schema rules-ht)
+  (let* ([join-vars  (cadr clause)]          ; e.g. (?e ?x)
+         [sub-clauses (cddr clause)]
+         ;; Create a restricted binding env containing ONLY the join vars
+         [restricted-bindings
+           (let ([new-ht (make-hashtable symbol-hash eq?)])
+             (for-each (lambda (v)
+                         (let ([val (binding-ref bindings v)])
+                           (when val (hashtable-set! new-ht v val))))
+                       join-vars)
+             new-ht)]
+         [results (evaluate-where-clauses db sub-clauses
+                    (list restricted-bindings) schema rules-ht)])
+    (if (null? results)
+        (list bindings)   ; sub-query failed → keep this binding
+        '())))            ; sub-query succeeded → exclude
+```
+
+Add `not-join-clause?` to `evaluate-single-clause`'s dispatch, and to
+`clause-bound-vars` / `clause-used-vars` / `score-clause` in `planner.ss`
+(it contributes no new bound vars, and its score follows the same logic as
+`not` — score 3 when join-vars are all bound, −100 otherwise).
+
+**Test:**
+```scheme
+(test "not-join excludes on explicit join var only"
+  ;; Entity has both :a/x and :a/y.  not-join on [?e] with ?y local.
+  ;; Should exclude entities that have ANY :a/y, not match by ?y value.
+  ...)
+```
+
+---
+
+#### `log` API Object
+
+**File:** `lib/jerboa-db/core.ss`, new `lib/jerboa-db/log.ss`
+
+Datomic exposes `(d/log conn)` as a navigable value that can be passed to
+`tx-range` and treated as an iterable sequence of transaction records.  Each
+record has:
+- `:db/txInstant` — the wall-clock time of the transaction
+- `:db.tx/data` — the datoms produced (as a sequence)
+
+Jerboa-DB has `(tx-range conn start end)` already.  To close the gap, wrap
+the connection's `tx-log` list into a log record:
+
+```scheme
+;; lib/jerboa-db/log.ss
+(library (jerboa-db log)
+  (export make-log log? log-conn log->tx-range)
+
+  (defstruct log-handle (conn))
+
+  ;; (log conn) → log-handle
+  (def (log conn) (make-log-handle conn))
+
+  ;; Navigate: (tx-range (log conn) start end) already works because
+  ;; tx-range's first arg is a conn.  For the log object form used in Datomic:
+  ;; (d/tx-range log {:start t1 :end t2})
+
+  ;; Iterable: returns all tx-reports in reverse-chronological order
+  (def (log->list log-handle)
+    (connection-tx-log (log-handle-conn log-handle)))
+
+  ;; Each tx-report is already a record with:
+  ;;   tx-report-db-before, tx-report-db-after, tx-report-tx-data, tx-report-tempids
+  ;; Add tx-instant accessor:
+  (def (tx-report-instant report)
+    ;; Extract db/txInstant from the tx-data datoms
+    (let ([inst-datom
+            (find (lambda (d)
+                    (let ([a (schema-lookup-by-id
+                               (db-value-schema (tx-report-db-after report))
+                               (datom-a d))])
+                      (and a (eq? (db-attribute-ident a) 'db/txInstant))))
+                  (tx-report-tx-data report))])
+      (and inst-datom (datom-v inst-datom)))))
+```
+
+Export `log` from `(jerboa-db core)`.  The existing `tx-range` already
+handles `conn` — no behavioral change needed, just the new `log` wrapper
+type that can be passed to `tx-range` as a convenience (detect `log-handle?`
+and unwrap the conn).
+
+---
+
+#### `index-range` and `seek-datoms`
+
+**File:** `lib/jerboa-db/core.ss`
+
+These are thin wrappers over the `datoms` function that was added in the
+previous session.  `datoms` already handles direct index access; these are
+Datomic-compatible name aliases.
+
+```scheme
+;; (index-range db attr start end)
+;; Returns all AVET datoms for attr whose value is in [start, end].
+(def (index-range db attr-ident start end)
+  ;; Equivalent to (datoms db 'avet attr-ident) filtered by [start, end]
+  (let* ([schema (db-value-schema db)]
+         [attr   (schema-lookup-by-ident schema attr-ident)]
+         [aid    (and attr (db-attribute-id attr))]
+         [idx    (db-resolve-index db 'avet)]
+         [lo     (make-datom 0 (or aid 0) (if start start +min-val+) 0 #t)]
+         [hi     (make-datom (greatest-fixnum) (or aid (greatest-fixnum))
+                             (if end end +max-val+) (greatest-fixnum) #t)]
+         [raw    (dbi-range idx lo hi)])
+    (filter (lambda (d)
+              (and (db-filter-datom? db d)
+                   (datom-added? d)))
+            raw)))
+
+;; (seek-datoms db index-name & components)
+;; Like datoms but positions a cursor at the given components and returns
+;; a lazy sequence from there to end-of-index.  Since we have no cursor
+;; abstraction, implement as a range from the given position to +∞.
+;; components follow the index order (e.g. eavt: e a v tx).
+(def (seek-datoms db index-name . components)
+  ;; Reuse datoms but with an open upper bound
+  (apply datoms db index-name components))
+```
+
+For a true cursor/lazy-sequence implementation, `seek-datoms` would ideally
+return a generator rather than a materialized list.  A generator form using
+`(std lazy)` or a simple stateful closure:
+
+```scheme
+(def (seek-datoms db index-name . components)
+  ;; Returns a thunk that yields datoms one at a time.
+  ;; For now, materialize as a list (correct, not lazy).
+  (apply datoms db index-name components))
+```
+
+Export both from `(jerboa-db core)`.
+
+---
+
+### Medium Effort (days each)
+
+#### Stored Database Functions (`:db/fn`)
+
+**Files:** `lib/jerboa-db/tx.ss`, `lib/jerboa-db/schema.ss`, `lib/jerboa-db/core.ss`
+
+In Datomic, you can store a Clojure function as a datom value and invoke it
+during transaction processing:
+
+```clojure
+{:db/ident :my-fn
+ :db/fn #db/fn {:lang :clojure
+                :params [db eid delta]
+                :code "(+ (d/q '[:find ?v :where [?e :counter/val ?v]] db) delta)"}}
+;; Then in a transaction:
+[:my-fn entity-id 1]
+```
+
+The function receives the current database value and returns additional
+transaction data (a list of `[:db/add ...]` operations).
+
+**Design for Jerboa-DB:**
+
+1. **New attribute** `db/fn`: `db.type/any`, stores a compiled procedure or
+   source code list.  Register in `bootstrap-schema!` at ID 14 (currently unused).
+
+2. **Schema change** (`schema.ss`): Add `db-attribute-fn` field to `db-attribute`
+   record, or treat `db.type/any` entities with `db/ident` + `db/fn` as
+   callable.
+
+3. **Transaction dispatch** (`tx.ss`): In `process-transaction`, after the
+   existing map/vector parsing, add a case for `(list fn-ident . args)`:
+   ```scheme
+   ;; In process-tx-op:
+   [(and (pair? op) (symbol? (car op)) (not (keyword? (car op))))
+    ;; Looks like a function invocation: (fn-ident arg1 arg2 ...)
+    (let* ([fn-ident (car op)]
+           [args (cdr op)]
+           [fn-attr (schema-lookup-by-ident schema fn-ident)]
+           [fn-val  (and fn-attr
+                         ;; Look up current value of db/fn for this ident's entity
+                         (lookup-fn-value db fn-ident))])
+      (unless fn-val
+        (error 'transact! "Unknown database function" fn-ident))
+      ;; Call the function with (current-db . args), collect returned tx-ops
+      (let ([result-ops (apply fn-val db args)])
+        ;; result-ops is a list of additional tx operations — recurse
+        (for-each (lambda (sub-op) (process-tx-op db sub-op schema)) result-ops)))]
+   ```
+
+4. **Storing functions**: In Jerboa, database functions are Jerboa `lambda`
+   values stored as `db.type/any`.  They are transacted like:
+   ```scheme
+   (transact! conn
+     (list `((db/ident . inc-counter)
+             (db/fn . ,(lambda (db eid delta)
+                         (let ([cur (ffirst (q '((find ?v) (where (?e counter/val ?v)))
+                                              db eid))])
+                           (list (list :db/add eid 'counter/val (+ cur delta)))))))))
+   ```
+
+5. **Security note**: Stored procedures execute arbitrary code.  For embedded
+   single-process use this is fine (same process trust boundary).  For server
+   mode (Phase 5), stored functions should be sandboxed or restricted to
+   pure functions with no side effects.
+
+**Effort estimate:** ~2 days.  The transaction dispatch change is surgical;
+the main complexity is serializing/deserializing the function value for LevelDB
+persistence (FASL handles arbitrary Scheme values, so this may work for free
+as long as closures are FASL-serializable — verify with `fasl-write` on a
+lambda).
+
+---
+
+#### Schema Migration (Rename / Retype Attributes)
+
+**File:** `lib/jerboa-db/migrate.ss` (skeleton exists at 270 lines)
+
+The current `migrate.ss` has `migrate!`, `reindex!`, `migration-plan`,
+`migration-dry-run` as stubs.  Additive migrations (new attributes) already
+work via `transact!` — the migration system needs to handle:
+
+1. **Attribute rename** — `{:db/id [:db/ident :old/name] :db/ident :new/name}`
+
+   Implementation: transact a retraction of `:old/name` + assertion of
+   `:new/name` for the schema entity.  The in-memory `schema-registry` must
+   be updated:
+   ```scheme
+   (def (migrate-rename! conn old-ident new-ident)
+     ;; 1. Find the schema entity for old-ident
+     (let* ([db (db conn)]
+            [schema (db-value-schema db)]
+            [attr (schema-lookup-by-ident schema old-ident)])
+       (unless attr (error 'migrate-rename! "Unknown attribute" old-ident))
+       (let ([eid (... find entity with db/ident = old-ident ...)])
+         ;; 2. Retract old ident, assert new ident in same tx
+         (transact! conn
+           (list (vector :db/retract eid 'db/ident old-ident)
+                 (vector :db/add    eid 'db/ident new-ident)))
+         ;; 3. Schema registry is updated automatically by materialize-schema-datoms!
+         )))
+   ```
+
+2. **Value type change** — only safe for compatible conversions (e.g., `string`
+   → `keyword` where all values are valid symbols, or any → `long` when all
+   values are integers).
+
+   Implementation:
+   ```scheme
+   (def (migrate-retype! conn attr-ident new-type coerce-fn)
+     ;; 1. Scan all current datoms for attr-ident via AEVT
+     ;; 2. For each, compute coerce-fn(old-value) → new-value
+     ;; 3. Build a transaction that retracts the old datom and asserts
+     ;;    the new value
+     ;; 4. Update the schema attribute's value-type
+     ...)
+   ```
+
+   A dry-run mode should scan all values and report any that `coerce-fn` cannot
+   handle before touching the data.
+
+3. **Attribute deletion** — retract all datoms for the attribute, then retract
+   the schema entity itself.  Must also drop the AVET index entries.
+
+   The `reindex!` function (already stubbed) handles rebuilding AVET after
+   adding `db/index` to an existing attribute.
+
+4. **Migration plan** (`migration-plan`): Return a list of operations as a
+   data structure (not executed), so callers can inspect and confirm.
+
+5. **LevelDB consistency**: After retype, if the attribute had AVET entries,
+   they need rebuilding under the new value encoding.  Call `reindex!` after
+   the value-type change.
+
+**Effort estimate:** ~3–4 days.  The transact-based rename is straightforward;
+retype requires a full AEVT scan and batch transaction which could be slow on
+large datasets.
+
+---
+
+### Architectural Improvements
+
+#### Hash-Join for Large Intermediate Relations
+
+**Files:** `lib/jerboa-db/query/engine.ss`, `lib/jerboa-db/query/planner.ss`
+
+**Problem:** Q4 (~2468ms) and Q8 (~2056ms) suffer from nested-loop join
+explosion.  The current algorithm is clause-at-a-time nested loop: for each
+existing binding, evaluate the next clause and produce new bindings.  When two
+large relations share a join variable, this is O(M × N).
+
+**Solution:** Detect binary joins between two clauses sharing a variable and
+execute them as a hash-join: build a hash table from the smaller side, probe
+with the larger.
+
+**Algorithm:**
+
+```
+Hash-join of clause A and clause B on shared variable ?x:
+1. Evaluate A independently → relation_A  (list of binding maps)
+2. Build hash table:  HT[value_of_?x] → list of bindings_from_A
+3. Evaluate B independently → relation_B  (list of binding maps)
+4. Probe: for each binding in relation_B,
+     look up HT[binding[?x]]
+     for each match in HT, merge the two bindings
+5. Result: merged binding list
+```
+
+**Planner change** (`planner.ss`): After `reorder-clauses`, add a
+`detect-hash-join-candidates` pass that identifies consecutive pairs of data
+patterns sharing a logic variable where neither is bound from the outer context
+(meaning they form a true binary join rather than a lookup).
+
+```scheme
+(def (detect-hash-join-candidates clauses bound-vars)
+  ;; Returns: list of (hash-join clause-A clause-B join-vars)
+  ;; or (sequential clause) for non-joinable clauses
+  (let loop ([clauses clauses] [bound bound-vars] [result '()])
+    (cond
+      [(null? clauses) (reverse result)]
+      [(null? (cdr clauses))
+       (reverse (cons (list 'sequential (car clauses)) result))]
+      [else
+       (let* ([ca (car clauses)]
+              [cb (cadr clauses)]
+              [vars-a (clause-bound-vars ca '())]
+              [vars-b (clause-bound-vars cb '())]
+              [shared (filter (lambda (v) (memq v vars-b)) vars-a)]
+              ;; Hash-join only if: both introduce vars, they share a join var,
+              ;; and the shared var isn't already bound from outside
+              [joinable? (and (pair? shared)
+                              (not (for-any (lambda (v) (memq v bound)) shared))
+                              (data-pattern? ca)
+                              (data-pattern? cb))])
+         (if joinable?
+             (loop (cddr clauses)
+                   (append vars-a vars-b bound)
+                   (cons (list 'hash-join ca cb shared) result))
+             (loop (cdr clauses)
+                   (append (clause-bound-vars ca bound) bound)
+                   (cons (list 'sequential ca) result))))])))
+```
+
+**Engine change** (`engine.ss`): In `evaluate-where-clauses`, check for
+`hash-join` plans and dispatch to `evaluate-hash-join`:
+
+```scheme
+(def (evaluate-hash-join db ca cb join-vars bindings-list schema)
+  ;; Evaluate both sides from the current bindings-list
+  (let* ([side-a (flatmap (lambda (b)
+                            (evaluate-single-clause db ca b schema #f))
+                          bindings-list)]
+         ;; Build probe table indexed on join-vars
+         [ht (make-hashtable equal-hash equal?)]
+         [_ (for-each (lambda (b)
+                        (let ([key (map (lambda (v) (binding-ref b v)) join-vars)])
+                          (hashtable-update! ht key
+                            (lambda (existing) (cons b existing)) '())))
+                      side-a)]
+         ;; Evaluate side-b and probe
+         [side-b (flatmap (lambda (b)
+                            (evaluate-single-clause db cb b schema #f))
+                          bindings-list)])
+    (flatmap (lambda (b-binding)
+               (let* ([key (map (lambda (v) (binding-ref b-binding v)) join-vars)]
+                      [matches (hashtable-ref ht key '())])
+                 (map (lambda (a-binding) (merge-bindings a-binding b-binding))
+                      matches)))
+             side-b)))
+
+(def (merge-bindings b1 b2)
+  ;; Merge two binding maps; b2 values win on conflict (shouldn't conflict on join vars)
+  (let ([new-ht (hashtable-copy b1 #t)])
+    (hashtable-walk b2 (lambda (k v) (hashtable-set! new-ht k v)))
+    new-ht))
+```
+
+**Expected impact:** For Q8, the join between 131K tracks and 13K releases
+should become O(131K + 13K) hash probe instead of O(131K × 13K) nested loop.
+Estimated 10–50× speedup on Q8.  Q4 has 428K output rows (true join result
+size) so hash-join reduces the intermediate work but not the output count.
+
+**Effort estimate:** ~1 week.  The planner change is surgical; the engine
+change requires careful handling of the shared binding context.
+
+---
+
+#### Cardinality Statistics for Planner
+
+**Files:** `lib/jerboa-db/query/planner.ss`, `lib/jerboa-db/stats.ss` (new)
+
+**Problem:** The planner has no information about how many datoms exist per
+attribute.  It scores patterns purely on whether variables are bound/unbound,
+not on actual selectivity.  For Q8, `(?r release/status ?status)` should start
+first (13K releases) but the planner starts from `(?t track/duration ?dur)`
+(131K tracks) because all patterns score equally with no bound vars.
+
+**Solution:** Maintain per-attribute datom counts, updated on every `transact!`.
+
+```scheme
+;; lib/jerboa-db/stats.ss (new)
+(library (jerboa-db stats)
+  (export make-db-stats db-stats? db-stats-attr-count
+          db-stats-update! db-stats-estimate-selectivity)
+
+  (defstruct db-stats
+    (attr-counts))     ;; hashtable: attr-id → integer (# of current datoms)
+
+  (def (make-db-stats) (make-db-stats (make-eq-hashtable)))
+
+  (def (db-stats-update! stats tx-datoms)
+    ;; Called after each transaction with the new datoms
+    (for-each (lambda (d)
+                (let ([key (datom-a d)])
+                  (hashtable-update! (db-stats-attr-counts stats)
+                    key
+                    (lambda (n) (if (datom-added? d) (+ n 1) (max 0 (- n 1))))
+                    0)))
+              tx-datoms))
+
+  (def (db-stats-attr-count stats attr-id)
+    (hashtable-ref (db-stats-attr-counts stats) attr-id 0))
+
+  ;; Estimate how selective a pattern (?e attr ?v) is when only attr is known.
+  ;; Lower count = more selective = higher score.
+  (def (db-stats-estimate-selectivity stats attr-id max-count)
+    (let ([n (db-stats-attr-count stats attr-id)])
+      (if (= n 0) 1000   ;; unknown → treat as very selective
+          (- 1000 (round (* 999 (/ n max-count))))))))
+```
+
+**Integration:**
+
+1. Add `db-stats` field to the `connection` record.
+2. In `transact!`, call `db-stats-update!` with the new tx-data.
+3. Pass `db-stats` to `reorder-clauses`, and use `db-stats-estimate-selectivity`
+   in `score-clause` for unbound data patterns:
+   ```scheme
+   ;; In score-clause for data patterns where e, v are both unbound:
+   ;; Use attribute cardinality if available, fall back to current heuristic
+   (let ([stat-score (if db-stats
+                         (db-stats-estimate-selectivity
+                           db-stats aid total-datom-count)
+                         20)])  ; fallback: attribute is always bound
+     (+ stat-score 20))
+   ```
+
+**Expected impact:** Q8 would start with `release/status` (13K datoms) instead
+of `track/duration` (131K datoms), potentially 10× speedup.
+
+**Effort estimate:** ~2 days for the stats maintenance; ~1 day for planner
+integration.
+
+---
+
+#### Vector-Indexed Bindings (O(1) Copy-on-Write)
+
+**Files:** `lib/jerboa-db/query/engine.ss`, `lib/jerboa-db/query/planner.ss`
+
+**Problem:** The current binding representation is a copy-on-write `eq?`
+hashtable.  `(hashtable-copy ht #t)` is O(n) where n = number of bindings.
+For Q4's 428K output rows, each with ~5 bound variables, this is ~2M hashtable
+copies.  Vector indexing would make `binding-set` O(1) (just copy a fixed-size
+vector + set one slot).
+
+**Design:**
+
+At query compile time (in `query-db`), assign each logic variable a slot index:
+
+```scheme
+(def (assign-var-slots find-vars where-clauses)
+  ;; Collect all logic vars in the query in encounter order
+  (let ([seen (make-hashtable symbol-hash eq?)]
+        [slots '()]
+        [next 0])
+    (def (visit v)
+      (when (and (logic-var? v) (not (hashtable-ref seen v #f)))
+        (hashtable-set! seen v next)
+        (set! slots (cons (cons v next) slots))
+        (set! next (+ next 1))))
+    (for-each visit find-vars)
+    (for-each (lambda (c) (for-each visit (clause-used-vars c))) where-clauses)
+    (values (list->hashtable slots) next)))  ; var→slot, total-slots
+```
+
+Replace the `eq?` hashtable binding with a flat vector:
+
+```scheme
+;; New binding representation: #(val0 val1 val2 ... ) — #f for unbound
+(def (make-empty-bindings n-slots) (make-vector n-slots #f))
+(def (binding-ref bindings slot)   (vector-ref bindings slot))
+(def (binding-set bindings slot val)
+  (let ([new (vector-copy bindings)])
+    (vector-set! new slot val)
+    new))
+```
+
+All call sites that use `(binding-ref bindings var)` become
+`(binding-ref bindings (hashtable-ref var-slots var 0))`.  The `var-slots`
+hashtable is closed over in `query-db` and threaded into all evaluation
+functions.
+
+**Impact:** `binding-set` drops from O(n) hashtable-copy to O(n) vector-copy,
+but `vector-copy` has much lower constant factor than `hashtable-copy`
+(contiguous memory, no hash chain traversal).  For small var counts (5–10),
+vector-copy is 5–10× faster than hashtable-copy.
+
+**Effort estimate:** ~1 week.  The change touches every function that creates
+or reads bindings, which is the entire query engine.  High impact, high risk.
+Recommend implementing on a branch with the full MBrainz benchmark suite as
+the regression guard.
+
+---
+
+### Infrastructure (Phase 5: HTTP Server)
+
+**File:** `lib/jerboa-db/server.ss` (221-line stub)
+
+The stub already has the library declaration, imports `(std net fiber-httpd)`,
+and outlines the handler structure.  What needs implementing:
+
+#### REST API design
+
+```
+POST /db/:name/transact      — submit a transaction (EDN or JSON body)
+POST /db/:name/q             — run a Datalog query (EDN or JSON body)
+GET  /db/:name/entity/:eid   — entity lookup
+GET  /db/:name/pull/:eid     — pull with pattern in query string
+GET  /db/:name/as-of/:t      — returns db-value token for time travel
+WS   /db/:name/tx-stream     — WebSocket: push each new tx-report to subscriber
+
+GET  /status                  — health check, returns db-stats JSON
+GET  /dbs                     — list open database names
+```
+
+#### Serialization
+
+Requests and responses use EDN (via `(std text edn)`) or JSON (via `(std text
+json)`).  Content-type negotiation:
+- `application/edn` → EDN (preferred, round-trips all Jerboa types)
+- `application/json` → JSON (limited: symbols become strings, refs lose type info)
+
+Datoms serialize as `[e a v tx added?]` EDN vectors.  Query results are
+lists of tuples.  Pull results are nested EDN maps.
+
+#### Connection pool
+
+A single `(std db conpool)` connection pool wraps the jerboa-db `connection`
+object.  Multiple fiber-httpd worker fibers share the pool.  Since jerboa-db
+`transact!` is synchronous and mutates the connection, use a single-writer
+mutex for `transact!` and allow concurrent reads (all `q`, `pull`, `entity`
+calls operate on immutable `db-value` snapshots and need no lock).
+
+```scheme
+;; In server.ss:
+(def *conn-registry* (make-hashtable string-hash equal?))  ; db-name → conn
+(def *write-mutex*   (make-mutex))                          ; serialize transact!
+
+(def (handle-transact! req db-name)
+  (with-mutex *write-mutex*
+    (let* ([conn (hashtable-ref *conn-registry* db-name #f)]
+           [ops  (edn-parse (request-body req))])
+      (let ([report (transact! conn ops)])
+        (response 200 (edn-write (tx-report->edn report)))))))
+
+(def (handle-query req db-name)
+  ;; No lock needed — operates on immutable snapshot
+  (let* ([conn (hashtable-ref *conn-registry* db-name #f)]
+         [db   (db conn)]  ; snapshot
+         [qform (edn-parse (request-body req))])
+    (response 200 (edn-write (q qform db)))))
+```
+
+#### WebSocket tx-stream
+
+On `transact!`, publish the tx-report to all active WebSocket subscribers for
+that database.  Use a per-database broadcast channel (from `(std actor)` or a
+simple list of open WebSocket handles):
+
+```scheme
+(def *subscribers* (make-hashtable string-hash equal?))  ; db-name → list of ws-handles
+
+(def (broadcast-tx! db-name report)
+  (let ([subs (hashtable-ref *subscribers* db-name '())])
+    (for-each (lambda (ws)
+                (ws-send! ws (edn-write (tx-report->edn report))))
+              subs)))
+```
+
+**Effort estimate:** ~2 weeks.  The fiber-httpd integration is straightforward;
+the main complexity is EDN/JSON serialization for all value types, and making
+the connection registry handle multiple named databases.
+
+---
+
+### Infrastructure (Phase 6: Raft Distribution)
+
+**File:** `lib/jerboa-db/replication.ss` (333-line stub)
+
+Full Raft-based distribution is months of work, but the architecture is clear.
+The key insight: jerboa-db's immutable `db-value` snapshots are ideal for
+replication — each transaction produces a new snapshot that can be shipped to
+replicas as a batch of datoms.
+
+#### Roles
+
+- **Leader (transactor):** Accepts `transact!` calls.  Writes to local
+  LevelDB.  Replicates the tx-data datoms to all follower log entries.
+  Commits when a quorum of followers ack.
+
+- **Follower (read peer):** Applies replicated tx-data to its own LevelDB
+  copy.  Serves `q`, `pull`, `entity` calls.  Never accepts `transact!`.
+
+- **Client peer (remote):** No local storage.  Sends queries and transactions
+  over the network to the leader/followers.  Caches recent db-values locally
+  in an LRU (mimicking Datomic's peer caching).
+
+#### Replication log
+
+Use `(std raft)` for leader election and log consensus.  Each log entry is a
+FASL-encoded list of datoms from one transaction.  Log entries are idempotent:
+applying the same datoms twice is safe because the index sees repeated entries
+and ignores already-asserted datoms.
+
+```scheme
+;; replication.ss: apply a replicated log entry to a local db
+(def (apply-log-entry! conn encoded-entry)
+  (let* ([datoms (fasl-decode encoded-entry)]
+         ;; Re-transact the raw datoms (skip validation, go direct to index)
+         [db-after (apply-raw-datoms (connection-current-db conn) datoms)])
+    (connection-current-db-set! conn db-after)))
+```
+
+#### Peer caching (the real Datomic secret)
+
+Datomic's performance at scale comes from peers caching immutable database
+segments in memory.  Since segments never mutate (only new segments are
+appended), a peer can cache the entire working set.  Queries never hit the
+transactor — they hit the peer's local cache.
+
+For jerboa-db, the equivalent is caching the `db-value` record (which is an
+immutable persistent RB-tree) on the remote peer.  After applying each tx,
+the peer holds the latest snapshot locally and all reads are local.
+
+This is implemented naturally by the existing design: the remote peer calls
+`(db conn)` to get a local snapshot and runs `q` against it.  The "caching"
+is just keeping the `connection` alive in the peer process.
+
+**Effort estimate:** ~2 months for a production-grade Raft implementation.
+The `(std raft)` module handles the consensus algorithm; the integration work
+is leader election, log shipping, and the remote peer client API (Phase 5
+prerequisite).
+
+---
+
 ## Why Build This
 
 Datomic is arguably the most innovative database of the last decade.  Its core
