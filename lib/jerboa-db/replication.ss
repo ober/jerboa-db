@@ -34,6 +34,7 @@
 
     ;; Lifecycle
     start-replication       stop-replication
+    start-replication-from-node!  ;; wrap a pre-configured raft-node (for transport adapter)
 
     ;; Multi-node local cluster convenience
     start-local-cluster
@@ -160,6 +161,17 @@
     (replication-state-running?-set! state #f)
     (raft-stop! (replication-state-raft-node state))
     (void))
+
+  ;; start-replication-from-node! : raft-node replication-config -> replication-state
+  ;;
+  ;; Wraps a caller-provided, already-started raft-node in a replication-state.
+  ;; Use this when the raft-node has been configured externally before being wrapped
+  ;; — for example, by (jerboa-db transport), which wires TCP proxy channels into
+  ;; the node's peers list before calling raft-start!.
+  ;;
+  ;; The caller is responsible for having called raft-start! on the node.
+  (def (start-replication-from-node! node config)
+    (make-replication-state config node #f 0 #t))
 
   ;; =========================================================================
   ;; Status / introspection

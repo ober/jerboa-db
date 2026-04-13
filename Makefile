@@ -7,7 +7,7 @@ CHEZ_EXT_DIR ?= $(HOME)/src
 CHEZ_EXT_LIBDIRS = $(CHEZ_EXT_DIR)/chez-lmdb:$(CHEZ_EXT_DIR)/chez-duckdb
 FULL_LIBDIRS = $(LIBDIRS):$(CHEZ_EXT_LIBDIRS)
 
-.PHONY: test test-cluster build clean check bench bench-quick mbrainz mbrainz-quick
+.PHONY: test test-cluster test-transport build clean check bench bench-quick mbrainz mbrainz-quick
 
 # Run the core test suite (in-memory, no FFI deps)
 test:
@@ -16,6 +16,10 @@ test:
 # Run cluster (Raft replication) tests
 test-cluster:
 	$(SCHEME) --libdirs "$(LIBDIRS)" --script tests/test-cluster.ss
+
+# Run TCP transport tests (two nodes connected via loopback)
+test-transport:
+	$(SCHEME) --libdirs "$(LIBDIRS)" --script tests/test-transport.ss
 
 # Run tests including LMDB backend
 test-lmdb:
