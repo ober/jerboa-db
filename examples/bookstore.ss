@@ -273,17 +273,11 @@
 (displayln "agent value after error + recovery: "
   (agent-value report-agent))
 
-;; await-for with a 50ms budget on an agent whose action busy-spins ~300ms.
-(def (now-ns)
-  (let ([t (current-time)])
-    (+ (time-nanosecond t) (* (time-second t) 1000000000))))
-
+;; await-for with a 50ms budget on an agent whose action sleeps ~300ms.
 (def slow-agent (agent 0))
 (send slow-agent
   (lambda (n)
-    (let ([deadline (+ (now-ns) 300000000)])  ;; ~300ms of spinning
-      (let loop ()
-        (when (< (now-ns) deadline) (loop))))
+    (sleep-ms 300)
     n))
 
 (def timed-out? (not (await-for 50 slow-agent)))
@@ -339,13 +333,11 @@
 (derive events-h 'order/any              'event/any)
 (derive events-h 'user/signup            'event/any)
 
-;; Dispatch resolves the most specific ancestor that has a method.
+;; Dispatch walks the custom hierarchy automatically — no need to
+;; hand-roll an ancestor search in the dispatch function.
 (defmulti handle-event
-  (lambda (evt)
-    (let ([t (cdr (assq 'type evt))])
-      (or (find (lambda (tag) (get-method handle-event tag))
-                (cons t (ancestors events-h t)))
-          t))))
+  (lambda (evt) (cdr (assq 'type evt)))
+  :hierarchy events-h)
 
 (defmethod handle-event 'order/new-member-order (e)
   (str "welcome-discount applied to order " (cdr (assq 'id e))))
@@ -356,10 +348,10 @@
 (defmethod handle-event 'event/any (e)
   (str "generic audit for " (cdr (assq 'type e))))
 
-;; Register the hierarchy with the multimethod via isa?-style dispatch.
-;; In Jerboa's std/multi, defmethod with a symbol key matches exactly;
-;; hierarchy-aware dispatch uses the global-hierarchy if you call
-;; `isa?` directly. The point here is to show `derive`/`ancestors`.
+;; Tell the multimethod to prefer the nearer ancestor when a
+;; dispatch value has methods at multiple levels of the hierarchy.
+(prefer-method handle-event 'order/any 'event/any)
+
 (displayln "ancestors of order/new-member-order: "
   (ancestors events-h 'order/new-member-order))
 (displayln "isa? order/new-member-order -> event/any: "
@@ -373,21 +365,23 @@
 ;; Section 10 — Spec: s-def + s-fdef + s-instrument
 ;; =====================================================================
 
-(section 10 "Spec: s-def + s-fdef + s-instrument")
+(section 10 "Spec: s-def + s-defn (script-safe validation)")
 
 (s-def ::isbn   (s-and string? (s-pred (lambda (s) (> (string-length s) 10)))))
 (s-def ::qty    (s-and integer? (s-pred positive?)))
 (s-def ::order  (s-cat ':isbn '::isbn
                        ':qty  '::qty))
+(s-def ::result (s-cat ':tag  symbol?
+                       ':isbn '::isbn
+                       ':qty  '::qty))
 
-(def (raw-place-order isbn qty)
+;; s-defn bakes arg/ret validation into the function body at expansion
+;; time — works in --script programs where s-instrument's top-level
+;; rewiring would race with earlier call-site closures.
+(s-defn place-order (isbn qty)
+  :args '::order
+  :ret  '::result
   (list 'order isbn qty))
-
-(def (place-order isbn qty)
-  (unless (s-valid? '::order (list isbn qty))
-    (error 'place-order "args do not conform to ::order"
-           (s-explain-str '::order (list isbn qty))))
-  (raw-place-order isbn qty))
 
 (displayln "valid call returns: "
   (place-order "978-0553560732" 2))
