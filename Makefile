@@ -7,11 +7,17 @@ CHEZ_EXT_DIR ?= $(HOME)/src
 CHEZ_EXT_LIBDIRS = $(CHEZ_EXT_DIR)/chez-lmdb:$(CHEZ_EXT_DIR)/chez-duckdb
 FULL_LIBDIRS = $(LIBDIRS):$(CHEZ_EXT_LIBDIRS)
 
-.PHONY: test test-cluster test-transport build clean check bench bench-quick mbrainz mbrainz-quick
+.PHONY: test test-cluster test-transport build clean check bench bench-quick mbrainz mbrainz-quick showcase
 
 # Run the core test suite (in-memory, no FFI deps)
 test:
 	$(SCHEME) --libdirs "$(LIBDIRS)" --script tests/test-core.ss
+
+# End-to-end Clojure-parity showcase (bookstore scenario).
+# Exercises: Datalog, pull, as-of, pmap, atom+validator, STM+io!,
+# agent+await-for, protocol, multi+hierarchy, spec, transducer, ->.
+showcase:
+	$(SCHEME) --libdirs "$(LIBDIRS)" --script examples/bookstore.ss
 
 # Run cluster (Raft replication) tests
 test-cluster:

@@ -4,12 +4,15 @@
 persistent index storage and DuckDB for analytics (planned).  Single binary,
 embeddable, with a Datalog query engine and immutable time-travel over all data.
 
-**Status:** 2026-04-13 — **Phases 1–3, 5, 6 (in-process + TCP transport), 7–8
-fully implemented and tested (52/52 tests pass; 34 core + 6 cluster + 12 transport).
-Phase 2 (LevelDB persistence) is production-ready.  Phase 4 (DuckDB) is
-structurally complete but build-dependent.  MBrainz benchmark harness complete
-(all 8 queries verified at 1% scale).  Three critical `(std raft)` bugs found
-and fixed during Phase 6.3 development.**
+**Status:** 2026-04-24 — **Core Datomic parity: complete.** Core test
+suite is 37/37 passing (`make test`), including `not-join`, the
+`variance`/`stddev` family, stored `:db/fn`, `log` API object,
+`index-range`, and `seek-datoms` — all previously tracked as gaps.
+Phase 2 (LevelDB persistence) is production-ready.  Phase 4 (DuckDB
+SQL-over-datoms) is functional; Parquet/CSV import helpers remain
+stubs pending DuckDB `COPY` wiring.  Remaining stubs: schema
+migration (rename/retype), Parquet export/import, CSV bulk import,
+TLS transport, CLI entrypoint.
 
 Implementation lives in `lib/jerboa-db/` (Jerboa library files using `#!chezscheme`
 + `(library ...)` form).  Built from scratch — no `(std mvcc)`, `(std datalog)`, or
@@ -51,13 +54,13 @@ they are unimplemented (❌), implemented (✅), or planned stubs (🚧).
 | Reverse refs in pull (`_attr`) | ✅ Done | `pull-attr-spec` handles `reverse-attr?` convention |
 | `:rules` / `%` in `:in` | ✅ Done | Recursive rules with fixed-point evaluation |
 | `not` clause | ✅ Done | Implicit-join-vars form |
-| `not-join` clause | ❌ Missing | Datomic's explicit-variable form of NOT |
+| `not-join` clause | ✅ Done | `query/engine.ss` + `query/planner.ss` — explicit join-vars form |
 | `or` clause | ✅ Done | Union of disjunctive branches |
 | Parameterized `:in` (scalar, tuple, collection, relation) | ✅ Done | All four binding forms implemented |
 | `count`, `sum`, `avg`, `min`, `max` aggregates | ✅ Done | Streaming single-pass with mutable accumulators |
 | `count-distinct` aggregate | ✅ Done | Implemented in `query/aggregates.ss` |
 | `median` aggregate | ✅ Done | Implemented |
-| `variance`, `stddev` aggregates | ❌ Missing | Not implemented |
+| `variance`, `stddev` aggregates | ✅ Done | Welford one-pass in `query/aggregates.ss`; `variance-sample` + `stddev-sample` variants for Bessel-corrected |
 | `rand`, `sample` aggregates | ✅ Done | Implemented in `query/aggregates.ss` |
 | `ground` function clause | ✅ Done | `[(ground 42) ?x]` in `query/functions.ss` |
 | `get-else`, `missing?` functions | ✅ Done | Implemented |
@@ -75,7 +78,7 @@ they are unimplemented (❌), implemented (✅), or planned stubs (🚧).
 | Tempid resolution | ✅ Done | String tempids, within-tx consistency |
 | Lookup refs as entity IDs | ✅ Done | `[attr-ident value]` pair resolution |
 | Schema migration (rename/retype) | 🚧 Stub | `migrate.ss` skeleton; additive-only works via `transact!` |
-| Stored database functions (`:db/fn`) | ❌ Missing | No eval-at-transact-time functions |
+| Stored database functions (`:db/fn`) | ✅ Done | `tx.ss` lookup + dispatch; `+db/fn+` attribute in bootstrap schema |
 | `:db.unique/identity` upsert | ✅ Done | Merges into existing entity |
 
 ### Time-Travel
@@ -86,7 +89,7 @@ they are unimplemented (❌), implemented (✅), or planned stubs (🚧).
 | `since` | ✅ Done | Filter to tx > N |
 | `history` | ✅ Done | All datoms including retracted |
 | `tx-range` | ✅ Done | Returns datoms from tx-log between two tx IDs |
-| `log` API object | ❌ Missing | Datomic exposes `(d/log conn)` as a first-class navigable object; `tx-range` takes `conn` directly here |
+| `log` API object | ✅ Done | `(jerboa-db log)` — `(log conn)` returns a navigable handle; `tx-range` also accepts `conn` directly |
 
 ### Index Access API
 
@@ -96,8 +99,8 @@ they are unimplemented (❌), implemented (✅), or planned stubs (🚧).
 | `pull-many` | ✅ Done | Exported from `core.ss` |
 | `entity` / `touch` | ✅ Done | Lazy entity maps with eager materialization |
 | `datoms` (direct index iteration) | ✅ Done | `(datoms db 'eavt eid)`, `(datoms db 'avet attr val)` — resolves ident symbols, applies time-travel filters |
-| `index-range` | ❌ Missing | Datomic's `(d/index-range db :attr start end)` — see Roadmap below |
-| `seek-datoms` | ❌ Missing | Positioned scan — see Roadmap below |
+| `index-range` | ✅ Done | `core.ss` — AVET range `[start, end]` filtered through time-travel |
+| `seek-datoms` | ✅ Done | `core.ss` — positioned scan; materialized list today (generator form is future work) |
 
 ### Distribution
 
