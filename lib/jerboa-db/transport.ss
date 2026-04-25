@@ -57,6 +57,7 @@
           (rename (only (chezscheme) make-time) (make-time chez-make-time))
           (jerboa prelude)
           (std net tcp)
+          (std net tls)
           (std fasl)
           (std misc channel)
           (std raft)
@@ -74,7 +75,8 @@
     (raft-node            ;; (std raft) raft-node — holds inbox + peers
      replication-state    ;; replication-state wrapping the raft-node
      listen-port          ;; actual TCP listen port (important when 0 was requested)
-     server               ;; tcp-server handle for the listen socket
+     server               ;; tcp-server (plain) or tls-conn (TLS) listen handle
+     tls-config           ;; tls-config record or #f (plain TCP)
      running?))           ;; mutable: set to #f by stop-transport-node!
 
   ;; =========================================================================
@@ -84,6 +86,43 @@
   ;; A unique value placed on proxy channels to signal the outbound fiber to exit.
   ;; Cannot appear as a real Raft message (which are vectors).
   (define %stop% (list 'transport-stop))
+
+  ;; =========================================================================
+  ;; TLS port adapters
+  ;; =========================================================================
+  ;;
+  ;; TLS gives us a single bidirectional `tls-conn` (SSL*) — but the rest of
+  ;; the transport works with Chez binary input/output ports.  These adapters
+  ;; wrap a tls-conn into the port abstractions so the framing layer below
+  ;; is agnostic to TCP vs. TLS.
+  ;;
+  ;; A single tls-conn is shared between the in-port and out-port.  Closing
+  ;; either port calls `tls-close`, which is idempotent.
+
+  (define (tls-conn->in-port conn)
+    (make-custom-binary-input-port "tls-in"
+      (lambda (bv start n)
+        (let ([buf (make-bytevector n)])
+          (let ([got (guard (exn [#t 0]) (tls-read conn buf n))])
+            (when (> got 0)
+              (bytevector-copy! buf 0 bv start got))
+            got)))
+      #f #f
+      (lambda () (guard (exn [#t (void)]) (tls-close conn)))))
+
+  (define (tls-conn->out-port conn)
+    (make-custom-binary-output-port "tls-out"
+      (lambda (bv start n)
+        (let ([slice (if (and (= start 0) (= n (bytevector-length bv)))
+                         bv
+                         (let ([s (make-bytevector n)])
+                           (bytevector-copy! bv start s 0 n)
+                           s))])
+          (guard (exn [#t (error 'tls-write-port "TLS write failed" exn)])
+            (tls-write conn slice))
+          n))
+      #f #f
+      (lambda () (guard (exn [#t (void)]) (tls-close conn)))))
 
   ;; =========================================================================
   ;; Wire protocol
@@ -140,46 +179,64 @@
   ;; Accept loop
   ;; =========================================================================
 
-  ;; start-accept-loop! : tcp-server channel → thread
+  ;; start-accept-loop! : server channel tls-config → thread
   ;;
-  ;; Accepts inbound TCP connections and starts an inbound listener for each.
-  ;; The out-port of accepted connections is closed immediately — inbound
-  ;; connections are receive-only in this scheme (peers dial us for their
-  ;; outbound traffic, we dial them for ours).
-  (define (start-accept-loop! server node-inbox)
+  ;; Accepts inbound connections and starts an inbound listener for each.
+  ;; In TCP mode, the out-port is closed immediately — inbound connections
+  ;; are receive-only (peers dial us for their outbound traffic).
+  ;; In TLS mode, accept yields a single bidirectional tls-conn; we wrap
+  ;; only its read side in a port and discard the write side (the underlying
+  ;; SSL is closed when the in-port is closed).
+  (define (start-accept-loop! server node-inbox tls-cfg)
     (fork-thread
       (lambda ()
         (let loop ()
-          (let ([conn (guard (exn [#t #f])
-                        (let-values ([(in out) (tcp-accept-binary server)])
-                          (cons in out)))])
-            (when conn
-              (guard (exn [#t (void)]) (close-port (cdr conn)))
-              (start-inbound-listener! (car conn) node-inbox)))
+          (cond
+            [tls-cfg
+             (let ([tconn (guard (exn [#t #f]) (tls-accept server))])
+               (when tconn
+                 (start-inbound-listener!
+                   (tls-conn->in-port tconn) node-inbox)))]
+            [else
+             (let ([conn (guard (exn [#t #f])
+                           (let-values ([(in out) (tcp-accept-binary server)])
+                             (cons in out)))])
+               (when conn
+                 (guard (exn [#t (void)]) (close-port (cdr conn)))
+                 (start-inbound-listener! (car conn) node-inbox)))])
           (loop)))))
 
   ;; =========================================================================
   ;; Outbound peer connector
   ;; =========================================================================
 
-  ;; start-peer-connector! : channel string integer → thread
+  ;; start-peer-connector! : channel string integer tls-config → thread
   ;;
-  ;; Maintains a persistent outbound TCP connection to one peer.
+  ;; Maintains a persistent outbound connection to one peer.
   ;; On connection failure, reconnects with exponential backoff (100ms → 5s).
   ;; Stops when the %stop% sentinel is received on proxy-ch.
   ;;
+  ;; If tls-cfg is non-#f, dials TLS via tls-connect and wraps the resulting
+  ;; tls-conn in a binary output port; otherwise uses plain TCP.
+  ;;
   ;; client-propose messages (#(client-propose cmd reply-ch)) are dropped
   ;; — they carry live reply channels and must never cross process boundaries.
-  (define (start-peer-connector! proxy-ch peer-host peer-port)
+  (define (start-peer-connector! proxy-ch peer-host peer-port tls-cfg)
     (fork-thread
       (lambda ()
         (let retry ([backoff-ms 100])
-          (let ([result (guard (exn [#t #f])
-                          (let-values ([(in out) (tcp-connect-binary peer-host peer-port)])
-                            (cons in out)))])
-            (if result
-              (let ([out-port (cdr result)])
-                ;; in-port (car result) is intentionally ignored: both ports share
+          (let ([out-port
+                 (guard (exn [#t #f])
+                   (cond
+                     [tls-cfg
+                      (let ([tconn (tls-connect peer-host peer-port tls-cfg)])
+                        (tls-conn->out-port tconn))]
+                     [else
+                      (let-values ([(in out) (tcp-connect-binary peer-host peer-port)])
+                        out)]))])
+            (if out-port
+              (begin
+                ;; in-port intentionally ignored in TCP mode: both ports share
                 ;; the same fd/closed? flag in fd->binary-ports, so closing in-port
                 ;; would destroy out-port too.  The fd is GC'd when the conn drops.
                 ;; Run the proxy loop; returns #t if disconnected, #f if stopped
@@ -218,15 +275,15 @@
   ;; (worst-case backoff) never fills the channel at 50 ms heartbeat rate.
   (define proxy-ch-capacity 1024)
 
-  ;; wire-peer! : (id host port) → (id . proxy-channel)
+  ;; wire-peer! : (id host port) tls-config → (id . proxy-channel)
   ;;
   ;; Creates a proxy channel for one peer and starts the outbound connector fiber.
-  (define (wire-peer! spec)
+  (define (wire-peer! spec tls-cfg)
     (let ([peer-id   (car   spec)]
           [peer-host (cadr  spec)]
           [peer-port (caddr spec)])
       (let ([proxy-ch (make-channel proxy-ch-capacity)])
-        (start-peer-connector! proxy-ch peer-host peer-port)
+        (start-peer-connector! proxy-ch peer-host peer-port tls-cfg)
         (cons peer-id proxy-ch))))
 
   ;; =========================================================================
@@ -238,36 +295,56 @@
   ;;   peer-specs  list of (id host port)
   ;;   data-path   string (":memory:" or file path — informational, passed to config)
   ;;   listen-port integer (0 = OS-assigned; use transport-node-listen-port to read back)
+  ;;   tls-config  (optional) tls-config record from (std net tls) or #f
   ;;   → transport-node
   ;;
-  ;; Creates a raft-node, wires TCP proxy channels for each peer, starts the
-  ;; TCP listener, and starts the Raft consensus engine.
+  ;; Creates a raft-node, wires proxy channels for each peer, starts the
+  ;; listener, and starts the Raft consensus engine.  When tls-config is
+  ;; supplied, uses TLS over TCP via libssl (verified peer certs by default
+  ;; — set verify-peer:/verify-hostname: in the config to relax for tests).
   ;;
   ;; To get a full DB-backed node with the cluster API, use start-transport-db-node!.
-  (def (start-transport-node! node-id peer-specs data-path listen-port)
+  (def (start-transport-node! node-id peer-specs data-path listen-port (tls-config #f))
     (let* ([node       (make-raft-node node-id)]
            [node-inbox (raft-node-inbox node)]
-           [peer-chans (map wire-peer! peer-specs)])
+           [peer-chans (map (lambda (s) (wire-peer! s tls-config)) peer-specs)])
       ;; Install proxy channels as the node's peers list
       (raft-node-peers-set! node peer-chans)
-      ;; Bind TCP listen socket
-      (let ([server (tcp-listen "0.0.0.0" listen-port 16)])
-        (let ([actual-port (tcp-server-port server)])
-          ;; Accept loop feeds the node's inbox from inbound connections
-          (start-accept-loop! server node-inbox)
-          ;; Start Raft consensus engine
-          (raft-start! node)
-          ;; Wrap in replication-state for cluster API compatibility
-          (let* ([config (new-replication-config node-id #f data-path)]
-                 [state  (start-replication-from-node! node config)])
-            (display (str "transport: node " node-id
-                          " listening on port " actual-port "\n"))
-            (make-transport-node node state actual-port server #t))))))
+      ;; Bind listen socket (plain TCP or TLS)
+      (let-values ([(server actual-port)
+                    (cond
+                      [tls-config
+                       (let* ([sconn (tls-listen "0.0.0.0" listen-port tls-config)]
+                              [fd    (%tls-server-port-from-conn sconn listen-port)])
+                         (values sconn fd))]
+                      [else
+                       (let ([s (tcp-listen "0.0.0.0" listen-port 16)])
+                         (values s (tcp-server-port s)))])])
+        ;; Accept loop feeds the node's inbox from inbound connections
+        (start-accept-loop! server node-inbox tls-config)
+        ;; Start Raft consensus engine
+        (raft-start! node)
+        ;; Wrap in replication-state for cluster API compatibility
+        (let* ([config (new-replication-config node-id #f data-path)]
+               [state  (start-replication-from-node! node config)])
+          (display (str "transport: node " node-id
+                        " listening on port " actual-port
+                        (if tls-config " (TLS)" "")
+                        "\n"))
+          (make-transport-node node state actual-port server tls-config #t)))))
+
+  ;; %tls-server-port-from-conn : tls-conn requested-port → integer
+  ;;
+  ;; tls-listen does not currently expose the bound port, so we fall back
+  ;; to the requested port.  When `requested-port` is 0 (OS-assigned), the
+  ;; caller cannot easily discover the assigned port — recommend passing
+  ;; an explicit non-zero port for TLS deployments.
+  (define (%tls-server-port-from-conn _conn requested-port) requested-port)
 
   ;; stop-transport-node! : transport-node → void
   ;;
   ;; Stops the Raft node, signals outbound proxy fibers to exit, and closes
-  ;; the TCP listen socket.
+  ;; the listen socket (TCP or TLS).
   (def (stop-transport-node! tnode)
     (transport-node-running?-set! tnode #f)
     ;; Stop Raft (sends stop-signal to inbox)
@@ -279,7 +356,11 @@
               (raft-node-peers (transport-node-raft-node tnode)))
     ;; Close listen socket
     (guard (exn [#t (void)])
-      (tcp-close (transport-node-server tnode))))
+      (cond
+        [(transport-node-tls-config tnode)
+         (tls-close (transport-node-server tnode))]
+        [else
+         (tcp-close (transport-node-server tnode))])))
 
   ;; transport-node-add-peer! :
   ;;   transport-node peer-id string integer → void
@@ -294,7 +375,8 @@
   ;;   (transport-node-add-peer! a 1 "127.0.0.1" (transport-node-listen-port b))
   (def (transport-node-add-peer! tnode peer-id peer-host peer-port)
     (let* ([node      (transport-node-raft-node tnode)]
-           [new-entry (wire-peer! (list peer-id peer-host peer-port))])
+           [tls-cfg   (transport-node-tls-config tnode)]
+           [new-entry (wire-peer! (list peer-id peer-host peer-port) tls-cfg)])
       ;; raft-node-add-peer! is thread-safe and also initialises next-index /
       ;; match-index if the node is already a leader, preventing send-heartbeats!
       ;; from crashing with a (cdr #f) on the new peer's missing entry.
@@ -309,14 +391,15 @@
   ;;   peer-specs list of (id host port)
   ;;   data-path  string (":memory:" or file path for persistent storage)
   ;;   listen-port integer (0 = OS-assigned)
+  ;;   tls-config (optional) tls-config record from (std net tls) or #f
   ;;   → (values transport-node replicated-conn)
   ;;
   ;; Creates the transport node, opens a DB connection at data-path, and
   ;; starts an apply fiber that replicates committed Raft entries into the
   ;; local DB.  Returns a replicated-conn compatible with the full cluster API:
   ;;   cluster-transact!, cluster-db, cluster-status, cluster-leader?
-  (def (start-transport-db-node! node-id peer-specs data-path listen-port)
-    (let* ([tnode  (start-transport-node! node-id peer-specs data-path listen-port)]
+  (def (start-transport-db-node! node-id peer-specs data-path listen-port (tls-config #f))
+    (let* ([tnode  (start-transport-node! node-id peer-specs data-path listen-port tls-config)]
            [state  (transport-node-replication-state tnode)]
            [conn   (connect data-path)]
            [fiber  (fork-thread

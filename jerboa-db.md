@@ -9,10 +9,11 @@ suite is 37/37 passing (`make test`), including `not-join`, the
 `variance`/`stddev` family, stored `:db/fn`, `log` API object,
 `index-range`, and `seek-datoms` — all previously tracked as gaps.
 Phase 2 (LevelDB persistence) is production-ready.  Phase 4 (DuckDB
-SQL-over-datoms) is functional; Parquet/CSV import helpers remain
-stubs pending DuckDB `COPY` wiring.  Remaining stubs: schema
-migration (rename/retype), Parquet export/import, CSV bulk import,
-TLS transport, CLI entrypoint.
+SQL-over-datoms) is functional with Parquet and CSV bulk I/O wired
+to DuckDB's native `COPY TO`/`COPY FROM`.  Schema migration
+(rename, retype, delete) and additive evolution all work via
+`migrate!`.  Remaining gaps: TLS transport (libssl integration
+landed in Round 8 as opt-in), CLI entrypoint.
 
 Implementation lives in `lib/jerboa-db/` (Jerboa library files using `#!chezscheme`
 + `(library ...)` form).  Built from scratch — no `(std mvcc)`, `(std datalog)`, or
@@ -33,10 +34,10 @@ synthetic data at configurable scale.  `make mbrainz-quick` for smoke test,
 | 1 | Core in-memory (datoms, indices, schema, Datalog, pull, time-travel) | ✅ Complete |
 | 2 | LevelDB persistence (`connect("path")`, 4-index LevelDB backend, FASL encoding) | ✅ Complete |
 | 3 | Query engine (planner, predicates, aggregates, rules, streaming) | ✅ Complete |
-| 4 | DuckDB analytics (SQL over datoms, Parquet export/import) | ✅ Core done, Parquet 🚧 |
+| 4 | DuckDB analytics (SQL over datoms, Parquet export/import, CSV import/export) | ✅ Complete |
 | 5 | Server mode (HTTP API, WebSocket tx-stream, remote peer) | ✅ Functional |
-| 6 | Raft HA (in-process + TCP transport, read replicas) | ✅ Complete (TLS 🚧) |
-| 7 | Polish (backup/restore ✅, GDPR excision ✅, schema migration 🚧) | ✅ Mostly done |
+| 6 | Raft HA (in-process + TCP transport, read replicas, opt-in TLS) | ✅ Complete |
+| 7 | Polish (backup/restore ✅, GDPR excision ✅, schema migration ✅) | ✅ Complete |
 | 8 | Advanced (fulltext ✅, GC ✅, entity specs ✅, composite tuples ✅) | ✅ Complete |
 
 ---
@@ -77,7 +78,7 @@ they are unimplemented (❌), implemented (✅), or planned stubs (🚧).
 | `db/tupleAttrs` composite tuples | ✅ Done | Auto-generation on transact |
 | Tempid resolution | ✅ Done | String tempids, within-tx consistency |
 | Lookup refs as entity IDs | ✅ Done | `[attr-ident value]` pair resolution |
-| Schema migration (rename/retype) | 🚧 Stub | `migrate.ss` skeleton; additive-only works via `transact!` |
+| Schema migration (rename/retype/delete) | ✅ Done | `migrate.ss` — `migrate-rename!`, `migrate-retype!` (with coerce-fn + reindex), `migrate-delete-attr!`, plus add/remove-index, merge, split |
 | Stored database functions (`:db/fn`) | ✅ Done | `tx.ss` lookup + dispatch; `+db/fn+` attribute in bootstrap schema |
 | `:db.unique/identity` upsert | ✅ Done | Merges into existing entity |
 
@@ -111,7 +112,7 @@ they are unimplemented (❌), implemented (✅), or planned stubs (🚧).
 | HTTP server | ✅ Done | `server.ss` — all REST + WebSocket endpoints; CLI entrypoint 🚧 |
 | Remote peer client | ✅ Done | `peer.ss` — transact, query, pull, multi-URL failover |
 | Raft consensus / HA (in-process) | ✅ Done | `replication.ss` + `cluster.ss`; 6/6 tests |
-| Raft consensus / HA (TCP transport) | ✅ Done | `transport.ss`; 12/12 tests; plain TCP (TLS 🚧) |
+| Raft consensus / HA (TCP transport) | ✅ Done | `transport.ss`; 12/12 tests; opt-in TLS via `:tls-config` argument (libssl-gated) |
 | Read replicas | ✅ Done | Follower apply fiber, ~50ms lag |
 
 ### Analytics
@@ -120,8 +121,8 @@ they are unimplemented (❌), implemented (✅), or planned stubs (🚧).
 |---|---|---|
 | Datalog aggregation (count/sum/avg/min/max) | ✅ Done | Built-in, streaming |
 | DuckDB SQL over datoms | ✅ Done | `analytics-export! db`, `analytics-query ae sql` — lazy-loaded, tables: `datoms` + `attrs` |
-| Parquet export/import | 🚧 Stub | `export-parquet`/`import-parquet` stubs in `analytics.ss` — DuckDB COPY TO wiring needed |
-| CSV bulk import | 🚧 Stub | `import-csv` stub in `analytics.ss` — DuckDB COPY FROM wiring needed |
+| Parquet export/import | ✅ Done | `export-parquet`/`import-parquet` in `analytics.ss` use DuckDB's native `COPY (...) TO 'path' (FORMAT PARQUET)` and `read_parquet(...)` |
+| CSV import/export | ✅ Done | `import-csv` reads via DuckDB `read_csv_auto`; `export-csv` writes via `COPY (...) TO 'path' (HEADER)` |
 
 ---
 
@@ -1996,7 +1997,7 @@ fit Datalog — aggregation over large datasets, window functions, ad-hoc SQL.
 - `analytics-export! db-val` — convenience one-liner: create engine + sync
 - `analytics-close! ae` — closes DuckDB handle
 - All exported from `(jerboa-db core)` via lazy-load (`ensure-analytics!`)
-- Parquet and CSV stubs present but not wired to DuckDB COPY TO/FROM
+- Parquet and CSV bulk I/O wired through DuckDB native `COPY TO`/`COPY FROM` (Round 8)
 
 DuckDB FFI
 availability is also build-dependent.  This phase is post-MBrainz work.
@@ -2647,9 +2648,10 @@ File: `lib/jerboa-db/analytics.ss`
 | DuckDB datom export | ✅ Done | `analytics-export! db-val` — full EAVT scan into `datoms` + `attrs` tables |
 | SQL query interface | ✅ Done | `analytics-query ae sql` — returns list of alists |
 | Lazy loading | ✅ Done | `ensure-analytics!` in `core.ss` — DuckDB not required for normal operation |
-| Parquet export | 🚧 Stub | `export-parquet` present; needs DuckDB `COPY TO` wiring |
-| Parquet import | 🚧 Stub | `import-parquet` present; needs DuckDB `COPY FROM` + datom re-ingestion |
-| CSV import | 🚧 Stub | `import-csv` present; needs DuckDB `COPY FROM` + datom re-ingestion |
+| Parquet export | ✅ Done | `export-parquet` wired to `duckdb-write-parquet` (`COPY (...) TO 'path' (FORMAT PARQUET)`) |
+| Parquet import | ✅ Done | `import-parquet` reads rows via `duckdb-read-parquet` and re-asserts datoms by column→attribute mapping |
+| CSV import | ✅ Done | `import-csv` reads rows via `duckdb-read-csv` and re-asserts datoms by column→attribute mapping |
+| CSV export | ✅ Done | `export-csv` (Round 8) wired to `duckdb-write-csv` |
 
 ### Server Mode (Phase 5) — ✅ FUNCTIONAL
 
@@ -2693,7 +2695,7 @@ Files: `lib/jerboa-db/migrate.ss`, `lib/jerboa-db/backup.ss`,
 
 | Feature | Status | Notes |
 |---|---|---|
-| Schema migration | ⚠️ Stub | Skeleton exists |
+| Schema migration | ✅ Done | `migrate-rename!`, `migrate-retype!`, `migrate-delete-attr!`, plus add/remove-index, merge, split (all in `migrate.ss`) |
 | Backup/restore | ✅ Done | FASL serialization |
 | Excision (GDPR) | ✅ Done | Physical removal from all 4 indices |
 | Prometheus metrics | ⚠️ Stub | Skeleton exists |

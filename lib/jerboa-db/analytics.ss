@@ -20,7 +20,8 @@
   (export
     new-analytics-engine analytics-engine?
     analytics-sync! analytics-query
-    export-parquet import-parquet import-csv
+    export-parquet import-parquet
+    export-csv     import-csv
     analytics-close)
 
   (import (except (chezscheme)
@@ -207,6 +208,15 @@
                    (car opts)
                    "SELECT * FROM datoms")])
       (duckdb-write-parquet (analytics-engine-duckdb-conn ae) sql path)))
+
+  ;; ---- CSV export ----
+
+  (def (export-csv ae path . opts)
+    ;; opts: optional SQL override (default: full datoms table)
+    (let ([sql (if (pair? opts)
+                   (car opts)
+                   "SELECT * FROM datoms")])
+      (duckdb-write-csv (analytics-engine-duckdb-conn ae) sql path)))
 
   ;; ---- Parquet import ----
   ;;

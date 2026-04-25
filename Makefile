@@ -7,7 +7,7 @@ CHEZ_EXT_DIR ?= $(HOME)/src
 CHEZ_EXT_LIBDIRS = $(CHEZ_EXT_DIR)/chez-lmdb:$(CHEZ_EXT_DIR)/chez-duckdb
 FULL_LIBDIRS = $(LIBDIRS):$(CHEZ_EXT_LIBDIRS)
 
-.PHONY: test test-cluster test-transport build clean check bench bench-quick mbrainz mbrainz-quick showcase
+.PHONY: test test-cluster test-transport test-transport-tls test-migrate build clean check bench bench-quick mbrainz mbrainz-quick showcase
 
 # Run the core test suite (in-memory, no FFI deps)
 test:
@@ -26,6 +26,22 @@ test-cluster:
 # Run TCP transport tests (two nodes connected via loopback)
 test-transport:
 	$(SCHEME) --libdirs "$(LIBDIRS)" --script tests/test-transport.ss
+
+# Run TLS transport tests (requires libssl + self-signed cert).
+# Generate the cert with:
+#   mkdir -p $(JERBOA_DB_TLS_DIR) && \
+#   openssl req -new -x509 -nodes -newkey rsa:2048 \
+#     -keyout $(JERBOA_DB_TLS_DIR)/server.key \
+#     -out $(JERBOA_DB_TLS_DIR)/server.crt \
+#     -days 1 -subj "/CN=localhost"
+JERBOA_DB_TLS_DIR ?= $(PREFIX)/tmp/jerboa-db-tls
+test-transport-tls:
+	JERBOA_DB_TLS_DIR=$(JERBOA_DB_TLS_DIR) \
+	$(SCHEME) --libdirs "$(LIBDIRS)" --script tests/test-transport-tls.ss
+
+# Run schema migration tests (rename/retype/delete/merge/split)
+test-migrate:
+	$(SCHEME) --libdirs "$(LIBDIRS)" --script tests/test-migrate.ss
 
 # Run tests including LMDB backend
 test-lmdb:
