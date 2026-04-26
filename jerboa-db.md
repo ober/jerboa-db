@@ -2372,11 +2372,11 @@ within ~700 ms.
 
 | Feature | Status | Notes |
 |---|---|---|
-| Local db-value caching | 🚧 TODO | Every query is a network round-trip; Datomic-style segment caching would let queries run locally |
-| WebSocket tx-stream | 🚧 TODO | `remote-tx-stream` stub raises an error; needs `(std net fiber-ws)` in a fiber context |
-| Named database support | 🚧 TODO | All ops target the server's "default" db; `/api/db/:name/...` routes not yet used |
-| `remote-entity` | 🚧 TODO | Entity API via `GET /api/entity/:eid` |
-| `remote-db` as db-value | 🚧 TODO | Currently returns a stats alist; should return a real `db-value` for passing to local `q`/`pull` |
+| Local db-value caching | ✅ Done (Round 9, Phase 49) | Datomic-style basis-tx-keyed LRU cache in peer client; tx-aware invalidation; tunable capacity (`remote-cache-set-capacity!`); stats via `remote-cache-stats` |
+| WebSocket tx-stream | ✅ Stub (Round 9, Phase 48) | `remote-tx-stream` connects to `/api/tx-stream` and dispatches frames to a callback; runs in a fiber poller |
+| Named database support | ✅ Done (Round 9, Phase 47) | `connect-remote` accepts an optional `db-name`; routes through `/api/db/:name/{transact,query,pull,entity,stats}` |
+| `remote-entity` | ✅ Done (Round 9, Phase 46) | `(remote-entity peer eid)` calls `GET /api/entity/:eid`; alist round-trips correctly |
+| `remote-db` as db-value | 🚧 Future | Currently returns a stats alist; full FASL-shipped db-value still pending |
 
 ##### Db-value caching (future)
 
@@ -2415,8 +2415,8 @@ These fixes are committed to `~/mine/jerboa` (commit c73d576).
 - ✅ `peer.ss` HTTP client — transact, query, pull with failover (multi-URL)
 - ✅ TCP transport for multi-process/multi-host clusters (Phase 6.3) — 12/12 tests pass
 - 🚧 TLS wrapping for production inter-node traffic
-- 🚧 WebSocket tx-stream in peer client
-- 🚧 Local db-value caching in peer client (Datomic-style segment cache)
+- ✅ WebSocket tx-stream in peer client (Round 9, Phase 48)
+- ✅ Local db-value caching in peer client — basis-tx LRU cache (Round 9, Phase 49)
 
 ### Phase 7: Polish and Ecosystem
 
@@ -2685,8 +2685,10 @@ Files: `lib/jerboa-db/replication.ss`, `lib/jerboa-db/cluster.ss`,
 | TCP transport (plain) | ✅ Done | `transport.ss` — 12/12 tests pass; length-framed FASL, reconnect backoff 100ms→5s, `raft-node-add-peer!` thread-safe |
 | TLS wrapping | 🚧 TODO | Replace `tcp-connect-binary`/`tcp-accept-binary` with `(std net tls)` equivalents |
 | Remote peer client (HTTP) | ✅ Done | `peer.ss` — connect-remote, remote-transact!, remote-q, remote-pull, multi-URL failover |
-| Remote peer — db-value cache | 🚧 TODO | Every op is a network round-trip; Datomic-style local snapshot not yet implemented |
-| Remote peer — WebSocket stream | 🚧 TODO | `remote-tx-stream` stub; needs fiber context wiring |
+| Remote peer — query-result cache | ✅ Done (Round 9 / Phase 49) | Basis-tx-keyed LRU; tunable capacity; `remote-cache-stats`, `remote-cache-clear!`, `remote-cache-set-capacity!` |
+| Remote peer — WebSocket stream | ✅ Stub (Round 9 / Phase 48) | `remote-tx-stream` connects to `/api/tx-stream` and dispatches frames to a callback |
+| Remote peer — named DB routing | ✅ Done (Round 9 / Phase 47) | `(connect-remote url db-name)` routes through `/api/db/:name/...` |
+| Remote peer — `remote-entity` | ✅ Done (Round 9 / Phase 46) | `GET /api/entity/:eid`; alist round-trips correctly via dotted-pair (de)normalization |
 
 ### Polish (Phase 7) — ✅ MOSTLY COMPLETE
 

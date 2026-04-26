@@ -125,17 +125,69 @@
         snapshot)))
 
   ;; ---- EDN helpers ----
+  ;;
+  ;; EDN has no notation for cons cells, and Scheme alists rely on dotted
+  ;; pairs. Encode each (k . v) pair as the proper 2-element list (k v) so
+  ;; the wire format is unambiguous (a (k v) sub-list distinguishes cleanly
+  ;; from a flat list, which a (cons k some-list) collapses into).
+
+  (def (edn-alist? x)
+    (and (pair? x)
+         (let loop ([l x])
+           (cond
+             [(null? l) #t]
+             [(and (pair? l)
+                   (pair? (car l))
+                   (symbol? (caar l)))
+              (loop (cdr l))]
+             [else #f]))))
+
+  (def (normalize-edn x)
+    (cond
+      [(null? x) x]
+      [(edn-alist? x)
+       (map (lambda (cell)
+              (list (car cell) (normalize-edn (cdr cell))))
+            x)]
+      [(pair? x) (cons (normalize-edn (car x)) (normalize-edn (cdr x)))]
+      [(vector? x)
+       (let* ([n (vector-length x)]
+              [v (make-vector n)])
+         (do ([i 0 (+ i 1)]) ((= i n) v)
+           (vector-set! v i (normalize-edn (vector-ref x i)))))]
+      [else x]))
 
   (def (respond-edn status obj)
     (respond status
       '(("Content-Type" . "application/edn"))
-      (edn->string obj)))
+      (edn->string (normalize-edn obj))))
 
   (def (parse-edn-body req)
     (let ([body (request-body req)])
       (if (and body (string? body) (> (string-length body) 0))
           (string->edn body)
           #f)))
+
+  ;; Convert wire-format tx-op entries (k v) back to dotted pairs (k . v).
+  ;; Mirrors the client-side normalization done by edn->string on alists.
+  (def (denormalize-tx-op op)
+    (cond
+      [(and (pair? op) (list? op))
+       (map (lambda (entry)
+              (cond
+                [(and (pair? entry)
+                      (pair? (cdr entry))
+                      (null? (cddr entry))
+                      (symbol? (car entry)))
+                 (cons (car entry) (cadr entry))]
+                [else entry]))
+            op)]
+      [else op]))
+
+  (def (denormalize-tx-ops tx-ops)
+    (if (and (pair? tx-ops) (list? tx-ops))
+        (map denormalize-tx-op tx-ops)
+        tx-ops))
 
   ;; ---- Route handlers ----
 
@@ -168,7 +220,7 @@
                                       (if (message-condition? exn)
                                           (condition-message exn)
                                           (format "~a" exn))))])
-      (let ([tx-ops (parse-edn-body req)])
+      (let ([tx-ops (denormalize-tx-ops (parse-edn-body req))])
         (unless tx-ops
           (error 'transact "empty or invalid EDN body"))
         (let ([report (transact! conn tx-ops)])

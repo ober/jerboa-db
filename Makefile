@@ -7,7 +7,7 @@ CHEZ_EXT_DIR ?= $(HOME)/src
 CHEZ_EXT_LIBDIRS = $(CHEZ_EXT_DIR)/chez-lmdb:$(CHEZ_EXT_DIR)/chez-duckdb
 FULL_LIBDIRS = $(LIBDIRS):$(CHEZ_EXT_LIBDIRS)
 
-.PHONY: test test-cluster test-transport test-transport-tls test-migrate build clean check bench bench-quick mbrainz mbrainz-quick showcase
+.PHONY: test test-cluster test-transport test-transport-tls test-migrate test-peer build clean check bench bench-quick mbrainz mbrainz-quick showcase
 
 # Run the core test suite (in-memory, no FFI deps)
 test:
@@ -42,6 +42,10 @@ test-transport-tls:
 # Run schema migration tests (rename/retype/delete/merge/split)
 test-migrate:
 	$(SCHEME) --libdirs "$(LIBDIRS)" --script tests/test-migrate.ss
+
+# Run peer client tests (HTTP server + remote-entity + named DB + cache)
+test-peer:
+	$(SCHEME) --libdirs "$(LIBDIRS)" --script tests/test-peer.ss
 
 # Run tests including LMDB backend
 test-lmdb:
